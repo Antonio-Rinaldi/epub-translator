@@ -18,6 +18,10 @@ from epub_translate_cli.domain.models import (
     TranslationSettings,
 )
 from epub_translate_cli.domain.ports import TranslatorPort
+from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
+
+
+logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,9 +75,24 @@ class XHTMLTranslator:
                     break
                 except RetryableTranslationError as exc:
                     last_error = exc
+                    logger.debug(
+                        "Retryable translation error | chapter=%s node=%s attempt=%s/%s error=%s",
+                        chapter.path,
+                        node_path,
+                        attempts,
+                        self.settings.retries + 1,
+                        str(exc),
+                    )
                     time.sleep(_backoff_seconds(attempt))
                 except NonRetryableTranslationError as exc:
                     last_error = exc
+                    logger.debug(
+                        "Non-retryable translation error | chapter=%s node=%s attempt=%s error=%s",
+                        chapter.path,
+                        node_path,
+                        attempts,
+                        str(exc),
+                    )
                     break
 
             if translated is None:
@@ -89,9 +108,10 @@ class XHTMLTranslator:
                 )
                 continue
 
-            # Replace text: normalize by placing all translated text into the element and clearing children.
-            # This allows minor normalization while preserving overall structure.
+            # Replace text while preserving inline tags/attributes (e.g., spans with font-size styles).
             _replace_element_text(elem, translated)
+
+            logger.debug("Translated node | chapter=%s node=%s", chapter.path, node_path)
 
             changes.append(
                 NodeChange(
@@ -114,39 +134,27 @@ class ChapterTranslationResult:
 
 
 _PROTECTED_ANCESTORS = {
-    "a": "protected_link",
     "code": "protected_code",
     "pre": "protected_code",
 }
 
 
 def _skip_reason(elem: etree._Element) -> Optional[SkipReason]:
-    # Protected: links and code blocks.
+    # Protected: code blocks and metadata regions.
     for anc in [elem, *elem.iterancestors()]:
         tag = etree.QName(anc.tag).localname.lower() if isinstance(anc.tag, str) else ""
         if tag in _PROTECTED_ANCESTORS:
             return _PROTECTED_ANCESTORS[tag]  # type: ignore[return-value]
 
-        # Footnote-ish heuristics: epub:type, role, or class.
-        footnote_reason = _footnote_reason(anc)
-        if footnote_reason is not None:
-            return footnote_reason
-
         # Metadata-ish regions.
         if tag in ("head", "title", "style", "script"):
             return "protected_metadata"
 
-    # Also protect inline descendants so links/code inside <p> are never modified.
+    # Also protect inline descendants containing code blocks or metadata.
     for descendant in elem.iterdescendants():
         d_tag = etree.QName(descendant.tag).localname.lower() if isinstance(descendant.tag, str) else ""
-        if d_tag == "a":
-            return "protected_link"
         if d_tag in ("code", "pre"):
             return "protected_code"
-
-        footnote_reason = _footnote_reason(descendant)
-        if footnote_reason is not None:
-            return footnote_reason
 
         if d_tag in ("style", "script"):
             return "protected_metadata"
@@ -154,22 +162,7 @@ def _skip_reason(elem: etree._Element) -> Optional[SkipReason]:
     return None
 
 
-def _footnote_reason(elem: etree._Element) -> Optional[SkipReason]:
-    epub_type = (elem.get("{http://www.idpf.org/2007/ops}type") or "").lower()
-    role = (elem.get("role") or "").lower()
-    classes = (elem.get("class") or "").lower()
-    if any(k in epub_type for k in ("noteref", "footnote", "endnote")):
-        return "protected_footnote"
-    if any(k in role for k in ("doc-noteref", "doc-footnote", "doc-endnote")):
-        return "protected_footnote"
-    if any(k in classes for k in ("footnote", "endnote", "noteref")):
-        return "protected_footnote"
-    return None
-
-
 _ws_re = re.compile(r"\s+")
-
-
 def _limit(text: str, max_len: int) -> str:
     cleaned = _ws_re.sub(" ", text).strip()
     if len(cleaned) <= max_len:
@@ -182,7 +175,24 @@ def _backoff_seconds(attempt: int) -> float:
 
 
 def _replace_element_text(elem: etree._Element, translated: str) -> None:
-    # Preserve tag/attributes but allow normalization by flattening children.
-    for child in list(elem):
-        elem.remove(child)
+    """Replace text content while preserving all child elements and their attributes.
+
+    Child elements are kept in the DOM so that CSS selectors and styling remain
+    intact, but their text content is cleared.  The translated text is placed
+    entirely in the parent element's ``.text`` property which inherits the
+    parent's (usually body-text) font size — preventing styled children from
+    inflating the visual size of the translated paragraph.
+    """
+    # Clear text inside every descendant but keep the element nodes themselves.
+    for child in elem.iterdescendants():
+        child.text = None
+        child.tail = None
+
+    # Place full translated text as the element's own text (before any children).
     elem.text = translated
+
+    # If the last child had a tail, ensure it's empty so no leftover text appears
+    # after preserved child nodes.
+    last = list(elem)
+    if last:
+        last[-1].tail = None

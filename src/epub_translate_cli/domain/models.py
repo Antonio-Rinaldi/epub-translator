@@ -48,9 +48,7 @@ class TranslationResponse:
 
 
 SkipReason = Literal[
-    "protected_link",
     "protected_code",
-    "protected_footnote",
     "protected_metadata",
     "empty",
 ]

@@ -15,6 +15,10 @@ from epub_translate_cli.domain.models import (
 )
 from epub_translate_cli.domain.ports import EpubBook, EpubRepositoryPort, ReportWriterPort, TranslatorPort
 from epub_translate_cli.infrastructure.epub.xhtml_parser import XHTMLTranslator
+from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
+
+
+logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,17 +34,21 @@ class TranslationOrchestrator:
         report_path: Path,
         settings: TranslationSettings,
     ) -> TranslationRunResult:
+        logger.info("Loading EPUB | path=%s", input_path)
         try:
             book = self.epub_repository.load(input_path)
         except Exception as exc:  # noqa: BLE001
             raise EpubReadError(str(exc)) from exc
+
+        logger.info("Loaded EPUB | chapters=%s", len(book.chapters))
 
         xhtml_translator = XHTMLTranslator(translator=self.translator, settings=settings)
 
         chapter_reports: list[ChapterReport] = []
         updated_items = dict(book.items)
 
-        for chapter in book.chapters:
+        for index, chapter in enumerate(book.chapters, start=1):
+            logger.info("Translating chapter %s/%s | path=%s", index, len(book.chapters), chapter.path)
             changes: list[NodeChange] = []
             failures: list[NodeFailure] = []
             skips: list[NodeSkip] = []
@@ -55,6 +63,14 @@ class TranslationOrchestrator:
                 skips.append(sk)
 
             updated_items[chapter.path] = updated_xhtml
+
+            logger.debug(
+                "Chapter completed | path=%s changed=%s failed=%s skipped=%s",
+                chapter.path,
+                len(changes),
+                len(failures),
+                len(skips),
+            )
 
             chapter_reports.append(
                 ChapterReport(
@@ -87,7 +103,9 @@ class TranslationOrchestrator:
         if settings.abort_on_error and failures_count > 0:
             output_written = False
             exit_code = 2
+            logger.info("Aborting EPUB write due to failures | failures=%s", failures_count)
         else:
+            logger.info("Writing translated EPUB | path=%s", output_path)
             try:
                 self.epub_repository.save(
                     EpubBook(items=updated_items, chapters=book.chapters),
@@ -98,6 +116,13 @@ class TranslationOrchestrator:
 
         report.output_written = output_written
         self.report_writer.write(report, report_path)
+        logger.info(
+            "Run completed | changed=%s failed=%s skipped=%s output_written=%s",
+            report.totals()["changed"],
+            report.totals()["failed"],
+            report.totals()["skipped"],
+            output_written,
+        )
 
         return TranslationRunResult(
             output_written=output_written,

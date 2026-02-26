@@ -7,6 +7,10 @@ from pathlib import Path
 from epub_translate_cli.domain.errors import EpubReadError, EpubWriteError
 from epub_translate_cli.domain.models import ChapterDocument
 from epub_translate_cli.domain.ports import EpubBook, EpubRepositoryPort
+from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
+
+
+logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class ZipEpubRepository(EpubRepositoryPort):
                 # Basic heuristic: treat HTML/XHTML as chapters.
                 chapters.append(ChapterDocument(path=name, xhtml_bytes=content))
 
+        logger.debug("EPUB repository load completed | items=%s chapters=%s", len(items), len(chapters))
         return EpubBook(items=items, chapters=chapters)
 
     def save(self, book: EpubBook, output_path: Path) -> None:
@@ -51,3 +56,5 @@ class ZipEpubRepository(EpubRepositoryPort):
                     zf.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
         except Exception as exc:  # noqa: BLE001
             raise EpubWriteError(str(exc)) from exc
+
+        logger.debug("EPUB repository save completed | items=%s path=%s", len(book.items), output_path)

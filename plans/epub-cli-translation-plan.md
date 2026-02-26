@@ -84,7 +84,7 @@ tests/
    - Locate paragraph-level text nodes
 4. For each paragraph node:
    - Apply eligibility filter before translation
-   - Skip node when inside links, footnotes, code/pre blocks, or metadata containers
+   - Skip node when inside code/pre blocks or metadata containers
    - Build translation prompt with chapter context and node text
    - Call Ollama with retry policy
    - Replace node text on success
@@ -133,6 +133,7 @@ tests/
   - `--retries` default `3`
   - `--report-out` optional; if missing derive near `--out`
   - `--abort-on-error` boolean default `false`
+  - `--log-level` default `INFO` (`DEBUG` for deeper diagnostics)
 - Exit codes:
   - `0` success
   - `1` validation or runtime failure
@@ -163,6 +164,7 @@ tests/
   - pure functions where possible
   - no hidden global state
   - deterministic error messages for reports
+  - logging policy: concise `INFO` milestones, detailed `DEBUG` internals
 
 ## 12. Mermaid Flow
 

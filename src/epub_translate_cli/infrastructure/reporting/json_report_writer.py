@@ -6,6 +6,10 @@ from pathlib import Path
 
 from epub_translate_cli.domain.models import RunReport
 from epub_translate_cli.domain.ports import ReportWriterPort
+from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
+
+
+logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -17,3 +21,4 @@ class JsonReportWriter(ReportWriterPort):
         payload["totals"] = report.totals()
 
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug("Report written | path=%s", report_path)

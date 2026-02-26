@@ -27,15 +27,20 @@ epub-translate \
 --target-lang it \
 --model translategemma:4b \
 --temperature 0.2 \
---retries 3
+--retries 3 \
+--log-level DEBUG
 ```
+
+### Logging
+- Default level is `INFO`
+- Set `--log-level DEBUG` for detailed runtime diagnostics (chapter internals, retries, Ollama call metadata)
 
 ### Safety rules
 This tool avoids translating protected content:
-- link text and URLs (`<a>`)
-- footnotes / endnotes regions (heuristics)
 - code blocks (`<code>`, `<pre>`)
-- metadata-ish containers (heuristics)
+- metadata-ish containers (`<head>`, `<title>`, `<style>`, `<script>`)
+
+All other content is translated, including links, footnotes, and endnotes.
 
 ## Exit codes
 - `0`: success

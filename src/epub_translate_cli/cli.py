@@ -11,9 +11,11 @@ from epub_translate_cli.application.services.translation_orchestrator import Tra
 from epub_translate_cli.domain.models import TranslationSettings
 from epub_translate_cli.infrastructure.epub.epub_repository import ZipEpubRepository
 from epub_translate_cli.infrastructure.llm.ollama_translator import OllamaTranslator
+from epub_translate_cli.infrastructure.logging.logger_factory import configure_logging, create_logger
 from epub_translate_cli.infrastructure.reporting.json_report_writer import JsonReportWriter
 
 console = Console()
+logger = create_logger(__name__)
 
 
 def translate(
@@ -26,8 +28,11 @@ def translate(
     retries: Annotated[int, typer.Option("--retries", min=0, max=10)] = 3,
     report_out: Annotated[Optional[Path], typer.Option("--report-out")] = None,
     abort_on_error: Annotated[bool, typer.Option("--abort-on-error")] = False,
+    log_level: Annotated[str, typer.Option("--log-level", help="Logging level: DEBUG or INFO")] = "INFO",
 ) -> None:
     """Translate an EPUB using a local Ollama model."""
+
+    configure_logging(log_level)
 
     report_path = report_out or out_path.with_suffix(out_path.suffix + ".report.json")
 
@@ -50,11 +55,28 @@ def translate(
         report_writer=report_writer,
     )
 
+    logger.info(
+        "Starting translation | in=%s out=%s source=%s target=%s model=%s",
+        in_path,
+        out_path,
+        source_lang,
+        target_lang,
+        model,
+    )
+
     result = orchestrator.translate_epub(
         input_path=in_path,
         output_path=out_path,
         report_path=report_path,
         settings=settings,
+    )
+
+    logger.info(
+        "Translation finished | output_written=%s failures=%s report=%s exit_code=%s",
+        result.output_written,
+        result.failures,
+        report_path,
+        result.exit_code,
     )
 
     console.print(f"Report written: {report_path}")

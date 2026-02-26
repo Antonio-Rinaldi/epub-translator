@@ -8,6 +8,10 @@ import requests
 from epub_translate_cli.domain.errors import NonRetryableTranslationError, RetryableTranslationError
 from epub_translate_cli.domain.models import TranslationRequest, TranslationResponse
 from epub_translate_cli.domain.ports import TranslatorPort
+from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
+
+
+logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,14 @@ class OllamaTranslator(TranslatorPort):
 
     def translate(self, request: TranslationRequest) -> TranslationResponse:
         prompt = _build_prompt(request)
+
+        logger.debug(
+            "Calling Ollama | model=%s source=%s target=%s text_len=%s",
+            request.model,
+            request.source_lang,
+            request.target_lang,
+            len(request.text),
+        )
 
         try:
             resp = requests.post(
@@ -48,6 +60,7 @@ class OllamaTranslator(TranslatorPort):
         if not text:
             raise RetryableTranslationError("Empty response from Ollama")
 
+        logger.debug("Ollama response received | text_len=%s", len(text))
         return TranslationResponse(translated_text=text)
 
 
