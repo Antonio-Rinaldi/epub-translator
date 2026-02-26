@@ -1,4 +1,4 @@
-# epub-translate-cli
+# epub-translator-cli
 
 Translate an EPUB by translating paragraph text nodes through a local Ollama model and producing:
 - a new EPUB (`--out`)

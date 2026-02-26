@@ -1,5 +1,5 @@
 [project]
-name = "epub-translate-cli"
+name = "epub-translator-cli"
 version = "0.1.0"
 description = "CLI tool to translate EPUB paragraph text via Ollama and write a translated EPUB plus JSON report."
 readme = "README.md"
