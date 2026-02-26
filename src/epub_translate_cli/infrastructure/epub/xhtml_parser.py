@@ -23,6 +23,9 @@ from epub_translate_cli.infrastructure.logging.logger_factory import create_logg
 
 logger = create_logger(__name__)
 
+# Regex to strip ``<<<`` / ``>>>`` fence markers the model might echo.
+_FENCE_RE = re.compile(r"^<<<\s*|\s*>>>$")
+
 
 @dataclass(frozen=True)
 class XHTMLTranslator:
@@ -33,9 +36,10 @@ class XHTMLTranslator:
         parser = etree.XMLParser(recover=True, resolve_entities=False)
         root = etree.fromstring(chapter.xhtml_bytes, parser=parser)
 
-        # Build a coarse context from the whole document text (bounded).
+        # Build a short context from the whole document text.
+        # Keep it small (500 chars) to reduce LLM confusion/context echo.
         full_text = " ".join(t.strip() for t in root.itertext() if t and t.strip())
-        chapter_context = _limit(full_text, 2000)
+        chapter_context = _limit(full_text, 500)
 
         changes: list[NodeChange] = []
         failures: list[NodeFailure] = []
@@ -71,7 +75,9 @@ class XHTMLTranslator:
             for attempt in range(self.settings.retries + 1):
                 attempts = attempt + 1
                 try:
-                    translated = self.translator.translate(request).translated_text
+                    raw = self.translator.translate(request).translated_text
+                    # Strip any ``<<<``/``>>>`` fences the model may echo.
+                    translated = _FENCE_RE.sub("", raw).strip()
                     break
                 except RetryableTranslationError as exc:
                     last_error = exc
@@ -175,24 +181,16 @@ def _backoff_seconds(attempt: int) -> float:
 
 
 def _replace_element_text(elem: etree._Element, translated: str) -> None:
-    """Replace text content while preserving all child elements and their attributes.
+    """Replace text content and remove all child elements.
 
-    Child elements are kept in the DOM so that CSS selectors and styling remain
-    intact, but their text content is cleared.  The translated text is placed
-    entirely in the parent element's ``.text`` property which inherits the
-    parent's (usually body-text) font size — preventing styled children from
-    inflating the visual size of the translated paragraph.
+    Child elements (spans, em, a, etc.) are removed entirely to avoid
+    producing self-closing tags like ``<span class="dropcap"/>`` which
+    HTML-based EPUB readers interpret as unclosed tags — causing all
+    subsequent content to inherit the child's styling (e.g. large font-size).
     """
-    # Clear text inside every descendant but keep the element nodes themselves.
-    for child in elem.iterdescendants():
-        child.text = None
-        child.tail = None
+    # Remove all direct children (and their descendants).
+    for child in list(elem):
+        elem.remove(child)
 
-    # Place full translated text as the element's own text (before any children).
+    # Place full translated text as the element's own text.
     elem.text = translated
-
-    # If the last child had a tail, ensure it's empty so no leftover text appears
-    # after preserved child nodes.
-    last = list(elem)
-    if last:
-        last[-1].tail = None

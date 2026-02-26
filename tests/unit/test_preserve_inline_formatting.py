@@ -37,8 +37,9 @@ def _translate_chapter(xhtml: bytes, translated_text: str) -> tuple[bytes, etree
     return updated, root
 
 
-def test_translate_preserves_child_elements_and_attributes() -> None:
-    """Child elements (spans with style/class) must stay in the DOM after translation."""
+def test_translate_removes_children_to_avoid_self_closing_tags() -> None:
+    """Child elements must be removed after translation to prevent self-closing
+    tags like <span/> which HTML-based EPUB readers interpret as unclosed."""
     xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
     <html xmlns='http://www.w3.org/1999/xhtml'>
       <body>
@@ -47,62 +48,33 @@ def test_translate_preserves_child_elements_and_attributes() -> None:
     </html>"""
 
     updated, root = _translate_chapter(xhtml, "Ciao piccolo mondo tradotto.")
-
     updated_text = updated.decode("utf-8")
-    # The span element and its style attribute must still be present.
-    assert "font-size:80%" in updated_text
-    assert "<span" in updated_text
 
     p = root.xpath("//*[local-name()='p']")[0]
-    rendered = "".join(p.itertext())
-    assert rendered == "Ciao piccolo mondo tradotto."
+    # Children must be removed — no spans left.
+    assert len(list(p)) == 0
+    assert p.text == "Ciao piccolo mondo tradotto."
+    # No self-closing span tags in the output.
+    assert "<span/>" not in updated_text
+    assert "<span />" not in updated_text
 
 
-def test_translate_does_not_inflate_dropcap() -> None:
-    """A dropcap span must remain in the DOM but not absorb translated text."""
+def test_translate_removes_dropcap_span() -> None:
+    """A dropcap span must be removed entirely to prevent font-size bleed."""
     xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
     <html xmlns='http://www.w3.org/1999/xhtml'>
       <body>
-        <p><span class='dropcap'>A</span> quick brown fox jumps over the lazy dog.</p>
+        <p><span class='dropcap'>A</span> quick brown fox.</p>
       </body>
     </html>"""
 
-    _, root = _translate_chapter(xhtml, "Un testo tradotto molto piu lungo della versione originale.")
-
-    span = root.xpath("//*[local-name()='span']")[0]
-    p = root.xpath("//*[local-name()='p']")[0]
-
-    # The dropcap span must still exist with its class.
-    assert span.get("class") == "dropcap"
-
-    # The span text must be empty (cleared) — all translated text is in elem.text.
-    assert (span.text or "") == ""
-
-    # Full paragraph text must still equal the translation.
-    rendered = "".join(p.itertext())
-    assert rendered == "Un testo tradotto molto piu lungo della versione originale."
-
-
-def test_translate_preserves_multiple_styled_children() -> None:
-    """Multiple children with different styles must all be preserved in the DOM."""
-    xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
-    <html xmlns='http://www.w3.org/1999/xhtml'>
-      <body>
-        <p><span class='title-big'>Chapter One:</span> <em>The Beginning</em> of something great.</p>
-      </body>
-    </html>"""
-
-    _, root = _translate_chapter(xhtml, "Capitolo Uno: L'Inizio di qualcosa di grande.")
-
-    updated_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
-
-    # Both child elements must survive.
-    assert "title-big" in updated_bytes
-    assert "<em" in updated_bytes
+    updated, root = _translate_chapter(xhtml, "Una volpe marrone veloce.")
+    updated_text = updated.decode("utf-8")
 
     p = root.xpath("//*[local-name()='p']")[0]
-    rendered = "".join(p.itertext())
-    assert rendered == "Capitolo Uno: L'Inizio di qualcosa di grande."
+    assert len(list(p)) == 0
+    assert p.text == "Una volpe marrone veloce."
+    assert "dropcap" not in updated_text
 
 
 def test_translate_plain_paragraph_no_children() -> None:
@@ -118,4 +90,52 @@ def test_translate_plain_paragraph_no_children() -> None:
 
     p = root.xpath("//*[local-name()='p']")[0]
     assert p.text == "Ciao mondo."
-    assert len(list(p)) == 0  # no children
+    assert len(list(p)) == 0
+
+
+def test_translate_preserves_paragraph_class() -> None:
+    """The paragraph's own class attribute must be preserved after translation."""
+    xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
+    <html xmlns='http://www.w3.org/1999/xhtml'>
+      <body>
+        <p class='calibre3'>Some text <em class='calibre1'>with emphasis</em> here.</p>
+      </body>
+    </html>"""
+
+    updated, root = _translate_chapter(xhtml, "Del testo con enfasi qui.")
+    updated_text = updated.decode("utf-8")
+
+    p = root.xpath("//*[local-name()='p']")[0]
+    assert p.get("class") == "calibre3"
+    assert p.text == "Del testo con enfasi qui."
+    # The em child must be removed.
+    assert len(list(p)) == 0
+
+
+def test_no_self_closing_tags_in_calibre_epub() -> None:
+    """Simulate the real sample1.epub structure (cotx + dropcap) and verify
+    no self-closing tags appear in the serialized output."""
+    xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
+    <html xmlns='http://www.w3.org/1999/xhtml'>
+      <body class='calibre'>
+        <p class='ct'>THE NETHERLANDS</p>
+        <p class='cotx'><span class='dropcap'>I</span>t is a fact of human nature.</p>
+        <p class='calibre3'>Next paragraph here.</p>
+      </body>
+    </html>"""
+
+    updated, root = _translate_chapter(xhtml, "Tradotto.")
+    updated_text = updated.decode("utf-8")
+
+    # No self-closing tags anywhere.
+    assert "<span/>" not in updated_text
+    assert "<span />" not in updated_text
+    assert "<em/>" not in updated_text
+    assert "<a/>" not in updated_text
+
+    # All paragraph classes preserved.
+    paras = root.xpath("//*[local-name()='p']")
+    classes = [p.get("class") for p in paras]
+    assert "ct" in classes
+    assert "cotx" in classes
+    assert "calibre3" in classes
