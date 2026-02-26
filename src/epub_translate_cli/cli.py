@@ -29,6 +29,7 @@ def translate(
     report_out: Annotated[Optional[Path], typer.Option("--report-out")] = None,
     abort_on_error: Annotated[bool, typer.Option("--abort-on-error")] = False,
     log_level: Annotated[str, typer.Option("--log-level", help="Logging level: DEBUG or INFO")] = "INFO",
+    ollama_url: Annotated[str, typer.Option("--ollama-url", help="Ollama API base URL")] = "http://localhost:11434",
 ) -> None:
     """Translate an EPUB using a local Ollama model."""
 
@@ -46,7 +47,7 @@ def translate(
     )
 
     epub_repo = ZipEpubRepository()
-    translator = OllamaTranslator()
+    translator = OllamaTranslator(base_url=ollama_url)
     report_writer = JsonReportWriter()
 
     orchestrator = TranslationOrchestrator(

@@ -15,7 +15,7 @@ pip install -e ".[dev]"
 
 ## Requirements
 - Python 3.9+
-- Ollama running locally
+- Ollama running locally (default: `http://localhost:11434`)
 
 ## Usage
 
@@ -28,8 +28,23 @@ epub-translate \
 --model translategemma:4b \
 --temperature 0.2 \
 --retries 3 \
---log-level DEBUG
+--log-level DEBUG \
+--ollama-url http://localhost:11434
 ```
+
+| Flag               | Default                  | Description                                                                 |
+|--------------------|--------------------------|-----------------------------------------------------------------------------|
+| `--in`             | *(required)*             | Input EPUB path                                                             |
+| `--out`            | *(required)*             | Output EPUB path                                                            |
+| `--source-lang`    | *(required)*             | Source language (e.g. `en`)                                                 |
+| `--target-lang`    | *(required)*             | Target language (e.g. `it`)                                                 |
+| `--model`          | *(required)*             | Ollama model name (translategemma:4b is light, fast and gives fine results) |
+| `--temperature`    | `0.2`                    | LLM sampling temperature (0.0–2.0)                                          |
+| `--retries`        | `3`                      | Retries per node on transient errors                                        |
+| `--report-out`     | derived                  | JSON report path (default: `<out>.report.json`)                             |
+| `--abort-on-error` | `false`                  | Abort and skip saving output if any node fails                              |
+| `--log-level`      | `INFO`                   | Logging verbosity (`INFO` or `DEBUG`)                                       |
+| `--ollama-url`     | `http://localhost:11434` | Ollama API base URL                                                         |
 
 ### Logging
 - Default level is `INFO`

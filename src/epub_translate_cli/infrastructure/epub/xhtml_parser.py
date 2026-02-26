@@ -26,6 +26,106 @@ logger = create_logger(__name__)
 # Regex to strip ``<<<`` / ``>>>`` fence markers the model might echo.
 _FENCE_RE = re.compile(r"^<<<\s*|\s*>>>$")
 
+# ---------------------------------------------------------------------------
+# Text-slot helpers
+# ---------------------------------------------------------------------------
+
+
+def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]]:
+    """Return all non-empty text slots in document order as (element, attr) pairs.
+
+    lxml stores inline text in two places per element:
+    * ``elem.text``  – text **before** the first child (or sole text content)
+    * ``child.tail`` – text **after** the child element but still inside ``elem``
+
+    We only include slots that contributed characters to the source text so
+    that we distribute the translation faithfully.
+    """
+    slots: list[tuple[etree._Element, str]] = []
+    if elem.text:
+        slots.append((elem, "text"))
+    for child in elem:
+        if child.text:
+            slots.append((child, "text"))
+        if child.tail:
+            slots.append((child, "tail"))
+    return slots
+
+
+def _distribute_text(translated: str, slot_lengths: list[int]) -> list[str]:
+    """Split *translated* into len(slot_lengths) chunks proportional to
+    *slot_lengths*, snapping each split point to the nearest word boundary.
+
+    If there is only one slot, the whole string is returned as-is.
+    If the translated string is shorter than the number of slots, excess
+    slots get empty strings.
+    """
+    if not slot_lengths:
+        return []
+    if len(slot_lengths) == 1:
+        return [translated]
+
+    total_orig = sum(slot_lengths)
+    if total_orig == 0:
+        # Edge case: all slots had zero length — put everything in the first.
+        return [translated] + [""] * (len(slot_lengths) - 1)
+
+    result: list[str] = []
+    remaining = translated
+    remaining_weight = total_orig
+
+    for i, weight in enumerate(slot_lengths[:-1]):
+        if not remaining:
+            result.append("")
+            continue
+
+        # Ideal split position (proportional).
+        ideal = round(len(remaining) * weight / remaining_weight)
+        ideal = max(0, min(ideal, len(remaining)))
+
+        # Snap to the nearest word boundary (prefer not to split a word).
+        split_pos = _nearest_word_boundary(remaining, ideal)
+
+        result.append(remaining[:split_pos])
+        # Do NOT lstrip — leading spaces belong to the next slot.
+        remaining = remaining[split_pos:]
+        remaining_weight -= weight
+
+    # Last chunk gets everything that's left.
+    result.append(remaining)
+    return result
+
+
+def _nearest_word_boundary(text: str, pos: int) -> int:
+    """Return the index of the nearest word boundary to *pos* in *text*.
+
+    Prefers the boundary immediately after *pos*; falls back to the one
+    immediately before it; falls back to *pos* itself if no whitespace found.
+    """
+    if pos >= len(text):
+        return len(text)
+    if pos == 0:
+        return 0
+
+    # Search forward for whitespace.
+    fwd = pos
+    while fwd < len(text) and not text[fwd].isspace():
+        fwd += 1
+
+    # Search backward for whitespace.
+    bwd = pos - 1
+    while bwd > 0 and not text[bwd].isspace():
+        bwd -= 1
+
+    # Choose closest; prefer forward on a tie.
+    dist_fwd = fwd - pos
+    dist_bwd = pos - bwd
+
+    if dist_fwd <= dist_bwd:
+        return fwd
+    else:
+        return bwd + 1  # +1: include the space in the previous chunk
+
 
 @dataclass(frozen=True)
 class XHTMLTranslator:
@@ -181,16 +281,57 @@ def _backoff_seconds(attempt: int) -> float:
 
 
 def _replace_element_text(elem: etree._Element, translated: str) -> None:
-    """Replace text content and remove all child elements.
+    """Replace paragraph text, redistributing across child text/tail slots.
 
-    Child elements (spans, em, a, etc.) are removed entirely to avoid
-    producing self-closing tags like ``<span class="dropcap"/>`` which
-    HTML-based EPUB readers interpret as unclosed tags — causing all
-    subsequent content to inherit the child's styling (e.g. large font-size).
+    Strategy
+    --------
+    The source text of a paragraph is spread across multiple lxml text slots
+    in document order::
+
+        <p>
+          {elem.text}
+          <span>{span.text}</span>{span.tail}
+          <em>{em.text}</em>{em.tail}
+          …
+        </p>
+
+    We collect those source slots, compute each slot's share of the total
+    character count, then split the *translated* string proportionally at
+    word boundaries and write each chunk back to its original slot.
+
+    This keeps each piece of text in its *owner* element so CSS styling
+    (font-size, italic, dropcap, etc.) is applied to the right words in the
+    translated output – maximally faithful to the original structure.
+
+    Self-closing tag prevention
+    ---------------------------
+    Setting ``.text = ""`` (empty string, *not* ``None``) on childless
+    elements forces lxml's XML serialiser to emit ``<span></span>`` instead
+    of ``<span/>``.  HTML-based EPUB readers misinterpret ``<span/>`` as an
+    unclosed opening tag, which causes all subsequent text to inherit the
+    span's styling (e.g. a dropcap ``font-size: 1.83333em`` bleeding through
+    the whole chapter).
     """
-    # Remove all direct children (and their descendants).
-    for child in list(elem):
-        elem.remove(child)
+    slots = _collect_text_slots(elem)
 
-    # Place full translated text as the element's own text.
-    elem.text = translated
+    if not slots:
+        # No text slots at all – place translated text directly.
+        elem.text = translated
+        return
+
+    # Lengths of the original text in each slot.
+    slot_lengths = [len(getattr(owner, attr) or "") for owner, attr in slots]
+
+    # Distribute translated text proportionally across slots.
+    chunks = _distribute_text(translated, slot_lengths)
+
+    for (owner, attr), chunk in zip(slots, chunks):
+        setattr(owner, attr, chunk)
+
+    # Ensure every child that received no text still gets an empty string
+    # (not None) so XML serialises it as <tag></tag> not <tag/>.
+    for child in elem:
+        if child.text is None:
+            child.text = ""
+        if child.tail is None:
+            child.tail = ""
