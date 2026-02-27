@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -145,7 +146,12 @@ class XHTMLTranslator:
         failures: list[NodeFailure] = []
         skips: list[NodeSkip] = []
 
-        # Translate only paragraph-like elements.
+        # Rolling window of the last N successfully translated paragraph texts.
+        # Used as prior-context for the next paragraph request so the LLM
+        # can maintain consistent tone and terminology within a chapter.
+        n_ctx = self.settings.context_paragraphs
+        recent_translations: deque[str] = deque(maxlen=n_ctx if n_ctx > 0 else 1)
+
         for elem in root.xpath("//*[local-name()='p']"):
             node_path = root.getroottree().getpath(elem)
 
@@ -159,6 +165,11 @@ class XHTMLTranslator:
                 skips.append(NodeSkip(chapter_path=chapter.path, node_path=node_path, reason="empty"))
                 continue
 
+            # Build prior-translation context string from the rolling window.
+            prior_translations = (
+                "\n".join(recent_translations) if n_ctx > 0 and recent_translations else ""
+            )
+
             request = TranslationRequest(
                 source_lang=self.settings.source_lang,
                 target_lang=self.settings.target_lang,
@@ -166,9 +177,10 @@ class XHTMLTranslator:
                 temperature=self.settings.temperature,
                 chapter_context=chapter_context,
                 text=before,
+                prior_translations=prior_translations,
             )
 
-            translated = None
+            translated: Optional[str] = None
             attempts = 0
             last_error: Optional[Exception] = None
 
@@ -227,6 +239,10 @@ class XHTMLTranslator:
                     after=_limit(translated, 200),
                 )
             )
+
+            # Add this translation to the rolling context window.
+            if n_ctx > 0:
+                recent_translations.append(translated)
 
         updated = etree.tostring(root, encoding="utf-8", xml_declaration=True)
         return updated, ChapterTranslationResult(changes=changes, failures=failures, skips=skips)

@@ -29,22 +29,26 @@ epub-translate \
 --temperature 0.2 \
 --retries 3 \
 --log-level DEBUG \
---ollama-url http://localhost:11434
+--ollama-url http://localhost:11434 \
+--workers 1 \
+--context-paragraphs 3
 ```
 
-| Flag               | Default                  | Description                                                                 |
-|--------------------|--------------------------|-----------------------------------------------------------------------------|
-| `--in`             | *(required)*             | Input EPUB path                                                             |
-| `--out`            | *(required)*             | Output EPUB path                                                            |
-| `--source-lang`    | *(required)*             | Source language (e.g. `en`)                                                 |
-| `--target-lang`    | *(required)*             | Target language (e.g. `it`)                                                 |
-| `--model`          | *(required)*             | Ollama model name (translategemma:4b is light, fast and gives fine results) |
-| `--temperature`    | `0.2`                    | LLM sampling temperature (0.0–2.0)                                          |
-| `--retries`        | `3`                      | Retries per node on transient errors                                        |
-| `--report-out`     | derived                  | JSON report path (default: `<out>.report.json`)                             |
-| `--abort-on-error` | `false`                  | Abort and skip saving output if any node fails                              |
-| `--log-level`      | `INFO`                   | Logging verbosity (`INFO` or `DEBUG`)                                       |
-| `--ollama-url`     | `http://localhost:11434` | Ollama API base URL                                                         |
+| Flag                   | Default                  | Description                                                                                                                 |
+|------------------------|--------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `--in`                 | *(required)*             | Input EPUB path                                                                                                             |
+| `--out`                | *(required)*             | Output EPUB path                                                                                                            |
+| `--source-lang`        | *(required)*             | Source language (e.g. `en`)                                                                                                 |
+| `--target-lang`        | *(required)*             | Target language (e.g. `it`)                                                                                                 |
+| `--model`              | *(required)*             | Ollama model name (translategemma:4b is light, fast and gives semidecent results, translategemma:12b is better but slower)  |
+| `--temperature`        | `0.2`                    | LLM sampling temperature (0.0–2.0)                                                                                          |
+| `--retries`            | `3`                      | Retries per node on transient errors                                                                                        |
+| `--report-out`         | derived                  | JSON report path (default: `<out>.report.json`)                                                                             |
+| `--abort-on-error`     | `false`                  | Abort and skip saving output if any node fails                                                                              |
+| `--log-level`          | `INFO`                   | Logging verbosity (`INFO` or `DEBUG`)                                                                                       |
+| `--ollama-url`         | `http://localhost:11434` | Ollama API base URL                                                                                                         |
+| `--workers`            | `1`                      | Parallel chapter workers (threads)                                                                                          |
+| `--context-paragraphs` | `3`                      | Number of previously translated paragraphs to include in the next paragraph translation prompt as context                   |
 
 ### Logging
 - Default level is `INFO`

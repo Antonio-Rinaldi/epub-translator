@@ -12,6 +12,8 @@ class TranslationSettings:
     temperature: float
     retries: int
     abort_on_error: bool
+    workers: int = 1
+    context_paragraphs: int = 3
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class TranslationRequest:
     temperature: float
     chapter_context: str
     text: str
+    prior_translations: str = ""
 
 
 @dataclass(frozen=True)

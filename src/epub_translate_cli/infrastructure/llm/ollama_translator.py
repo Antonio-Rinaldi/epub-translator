@@ -135,6 +135,14 @@ def _build_prompt(req: TranslationRequest) -> str:
             f"<<<\n{req.chapter_context}\n>>>\n\n"
         )
 
+    prior_block = ""
+    if req.prior_translations:
+        prior_block = (
+            "Below are the last translated paragraphs (for tone/terminology continuity only). "
+            "Do NOT repeat or include these in your response:\n"
+            f"<<<\n{req.prior_translations}\n>>>\n\n"
+        )
+
     return (
         f"You are a professional book translator from {req.source_lang} to {req.target_lang}.\n\n"
         "RULES:\n"
@@ -144,6 +152,7 @@ def _build_prompt(req: TranslationRequest) -> str:
         "- Preserve meaning, tone, and punctuation.\n"
         "- The translated text must have roughly the same length as the original.\n\n"
         f"{context_block}"
+        f"{prior_block}"
         "Translate the following text:\n"
         f"<<<\n{req.text}\n>>>\n"
     )
