@@ -46,6 +46,10 @@ def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]
     if elem.text:
         slots.append((elem, "text"))
     for child in elem:
+        # Skip non-element nodes such as _Entity (&nbsp;, &mdash;, …) and
+        # _Comment nodes – their .text is read-only or has different semantics.
+        if not isinstance(child, etree._Element):
+            continue
         if child.text:
             slots.append((child, "text"))
         if child.tail:
@@ -347,6 +351,8 @@ def _replace_element_text(elem: etree._Element, translated: str) -> None:
     # Ensure every child that received no text still gets an empty string
     # (not None) so XML serialises it as <tag></tag> not <tag/>.
     for child in elem:
+        if not isinstance(child, etree._Element):
+            continue
         if child.text is None:
             child.text = ""
         if child.tail is None:

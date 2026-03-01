@@ -118,3 +118,31 @@ class TranslationRunResult:
     output_written: bool
     failures: int
     exit_code: int
+
+
+# ---------------------------------------------------------------------------
+# Audiobook models
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AudioSettings:
+    """Settings for audiobook generation (completely independent of translation)."""
+
+    model: str
+    ollama_url: str = "http://localhost:11434"
+
+
+@dataclass(frozen=True)
+class AudioRequest:
+    """Ask the voice model to read *text* aloud and return raw audio bytes."""
+
+    model: str
+    text: str
+
+
+@dataclass(frozen=True)
+class AudioResponse:
+    """Raw audio bytes returned by the voice generator."""
+
+    audio_bytes: bytes
+    format: str = "wav"
