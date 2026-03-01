@@ -129,7 +129,8 @@ class AudioSettings:
     """Settings for audiobook generation (completely independent of translation)."""
 
     model: str
-    ollama_url: str = "http://localhost:11434"
+    base_url: str = "http://localhost:11434"
+    voice: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ class AudioRequest:
 
     model: str
     text: str
+    voice: str = ""
 
 
 @dataclass(frozen=True)

@@ -11,20 +11,35 @@ from rich.console import Console
 from epub_translate_cli.application.services.audiobook_orchestrator import AudiobookOrchestrator
 from epub_translate_cli.application.services.translation_orchestrator import TranslationOrchestrator
 from epub_translate_cli.domain.models import AudioSettings, TranslationSettings
+from epub_translate_cli.domain.ports import AudioGeneratorPort
 from epub_translate_cli.infrastructure.epub.epub_repository import ZipEpubRepository
 from epub_translate_cli.infrastructure.llm.ollama_audio_generator import OllamaAudioGenerator
 from epub_translate_cli.infrastructure.llm.ollama_translator import OllamaTranslator
+from epub_translate_cli.infrastructure.llm.openai_speech_audio_generator import OpenAISpeechAudioGenerator
 from epub_translate_cli.infrastructure.logging.logger_factory import configure_logging, create_logger
 from epub_translate_cli.infrastructure.reporting.json_report_writer import JsonReportWriter
 
 console = Console()
 logger = create_logger(__name__)
 
+# Supported voice backend identifiers.
+_BACKEND_OLLAMA = "ollama"
+_BACKEND_OPENAI_SPEECH = "openai-speech"
+_VOICE_BACKENDS = (_BACKEND_OLLAMA, _BACKEND_OPENAI_SPEECH)
+
 
 def _abort(msg: str) -> None:
     """Print an error and exit with code 1 before any processing begins."""
     console.print(f"[bold red]Error:[/bold red] {msg}")
     raise typer.Exit(code=1)
+
+
+def _build_audio_generator(backend: str, base_url: str) -> AudioGeneratorPort:
+    """Instantiate the correct ``AudioGeneratorPort`` implementation."""
+    if backend == _BACKEND_OPENAI_SPEECH:
+        return OpenAISpeechAudioGenerator(base_url=base_url)
+    # Default: ollama /api/generate
+    return OllamaAudioGenerator(base_url=base_url)
 
 
 def translate(
@@ -40,12 +55,14 @@ def translate(
     log_level: Annotated[str, typer.Option("--log-level", help="Logging level: DEBUG or INFO")] = "INFO",
     ollama_url: Annotated[str, typer.Option("--ollama-url", help="Ollama API base URL for the translation model")] = "http://localhost:11434",
     workers: Annotated[int, typer.Option("--workers", min=1, max=32, help="Parallel chapter workers")] = 1,
-    context_paragraphs: Annotated[int, typer.Option("--context-paragraphs", min=0, max=20, help="Rolling context: number of preceding translated paragraphs to include in each request (0 to disable)")] = 3,
+    context_paragraphs: Annotated[int, typer.Option("--context-paragraphs", min=0, max=20, help="Rolling context: number of preceding translated paragraphs per request (0 to disable)")] = 3,
     # ── Audiobook options ────────────────────────────────────────────────────
     generate_audiobook: Annotated[bool, typer.Option("--generate-audiobook", is_flag=True, help="Generate a per-chapter audiobook alongside the translated EPUB")] = False,
     audiobook_out: Annotated[Optional[Path], typer.Option("--audiobook-out", help="Directory to write per-chapter audio files (default: <out_stem>_audiobook/)")] = None,
-    voice_model: Annotated[Optional[str], typer.Option("--voice-model", help="Ollama TTS model name for audiobook generation (independent of --model)")] = None,
-    voice_ollama_url: Annotated[str, typer.Option("--voice-ollama-url", help="Ollama API base URL for the TTS model (defaults to --ollama-url)")] = "http://localhost:11434",
+    voice_model: Annotated[Optional[str], typer.Option("--voice-model", help="TTS model name for audiobook generation (independent of --model)")] = None,
+    voice_base_url: Annotated[str, typer.Option("--voice-base-url", help="Base URL of the TTS server (default: http://localhost:11434 for ollama, http://localhost:5005 for openai-speech)")] = "",
+    voice_backend: Annotated[str, typer.Option("--voice-backend", help=f"TTS backend to use: {' | '.join(_VOICE_BACKENDS)}.  'openai-speech' targets POST /v1/audio/speech (Orpheus-FastAPI, Kokoro-FastAPI, …); 'ollama' targets /api/generate")] = _BACKEND_OPENAI_SPEECH,
+    voice: Annotated[str, typer.Option("--voice", help="Voice name passed to the TTS backend (e.g. 'tara', 'leo' for Orpheus). Leave empty for the backend default.")] = "",
 ) -> None:
     """Translate an EPUB using a local Ollama model, and optionally generate an audiobook."""
 
@@ -59,7 +76,7 @@ def translate(
     if not in_path.is_file():
         _abort(f"--in must point to a file, not a directory: {in_path}")
 
-    # 2. Output EPUB: create parent directory tree if it doesn't exist yet.
+    # 2. Output EPUB: create parent directory tree if needed.
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 3. Audiobook-specific checks only when --generate-audiobook is set.
@@ -67,7 +84,9 @@ def translate(
     if generate_audiobook:
         if not voice_model:
             _abort("--voice-model is required when --generate-audiobook is set")
-        # Create the audiobook output directory tree if it doesn't exist yet.
+        if voice_backend not in _VOICE_BACKENDS:
+            _abort(f"--voice-backend must be one of: {', '.join(_VOICE_BACKENDS)}")
+        # Create the audiobook output directory tree if needed.
         effective_audio_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Build settings & infrastructure ─────────────────────────────────────
@@ -144,20 +163,30 @@ def translate(
     # ── Audiobook generation (optional, independent pipeline) ────────────────
 
     if generate_audiobook and result.output_written:
-        effective_voice_url = voice_ollama_url or ollama_url
+        # Resolve effective TTS base URL: explicit flag > per-backend default.
+        if voice_base_url:
+            effective_tts_url = voice_base_url
+        elif voice_backend == _BACKEND_OPENAI_SPEECH:
+            effective_tts_url = "http://localhost:5005"
+        else:
+            effective_tts_url = ollama_url
+
         audio_settings = AudioSettings(
-            model=voice_model,  # type: ignore[arg-type]  # guarded by pre-flight check above
-            ollama_url=effective_voice_url,
+            model=voice_model,  # type: ignore[arg-type]  # guarded by pre-flight
+            base_url=effective_tts_url,
+            voice=voice,
         )
 
         logger.info(
-            "Starting audiobook generation | model=%s url=%s dir=%s",
+            "Starting audiobook generation | backend=%s model=%s url=%s voice=%s dir=%s",
+            voice_backend,
             voice_model,
-            effective_voice_url,
+            effective_tts_url,
+            voice or "(default)",
             effective_audio_dir,
         )
 
-        audio_generator = OllamaAudioGenerator(base_url=effective_voice_url)
+        audio_generator = _build_audio_generator(voice_backend, effective_tts_url)
         audio_orchestrator = AudiobookOrchestrator(
             epub_repository=epub_repo,
             audio_generator=audio_generator,

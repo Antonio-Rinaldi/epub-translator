@@ -109,7 +109,6 @@ class AudiobookOrchestrator:
                 continue
 
             stem = Path(chapter.path).stem
-            out_file = audiobook_dir / f"{stem}.wav"
 
             logger.info(
                 "Generating audio %s/%s | chapter=%s chars=%s",
@@ -121,8 +120,9 @@ class AudiobookOrchestrator:
 
             try:
                 response = self.audio_generator.generate(
-                    AudioRequest(model=settings.model, text=text)
+                    AudioRequest(model=settings.model, text=text, voice=settings.voice)
                 )
+                out_file = audiobook_dir / f"{stem}.{response.format}"
                 out_file.write_bytes(response.audio_bytes)
                 written += 1
                 logger.debug("Audio written | path=%s bytes=%s", out_file, len(response.audio_bytes))
