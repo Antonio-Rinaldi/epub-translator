@@ -32,6 +32,16 @@ _FENCE_RE = re.compile(r"^<<<\s*|\s*>>>$")
 # ---------------------------------------------------------------------------
 
 
+# Node types whose .text attribute is read-only (they are _Element subclasses
+# in lxml but only hold content, not writable text slots).
+_CONTENT_ONLY_TYPES = (etree._Entity, etree._Comment, etree._ProcessingInstruction)
+
+
+def _is_writable_element(node: etree._Element) -> bool:
+    """Return True only for regular element nodes with writable .text/.tail."""
+    return not isinstance(node, _CONTENT_ONLY_TYPES)
+
+
 def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]]:
     """Return all non-empty text slots in document order as (element, attr) pairs.
 
@@ -41,14 +51,16 @@ def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]
 
     We only include slots that contributed characters to the source text so
     that we distribute the translation faithfully.
+
+    Note: ``_Entity``, ``_Comment``, and ``_ProcessingInstruction`` are all
+    subclasses of ``_Element`` in lxml but their ``.text`` attribute is
+    read-only, so they must be filtered out explicitly.
     """
     slots: list[tuple[etree._Element, str]] = []
     if elem.text:
         slots.append((elem, "text"))
     for child in elem:
-        # Skip non-element nodes such as _Entity (&nbsp;, &mdash;, …) and
-        # _Comment nodes – their .text is read-only or has different semantics.
-        if not isinstance(child, etree._Element):
+        if not _is_writable_element(child):
             continue
         if child.text:
             slots.append((child, "text"))
@@ -351,7 +363,7 @@ def _replace_element_text(elem: etree._Element, translated: str) -> None:
     # Ensure every child that received no text still gets an empty string
     # (not None) so XML serialises it as <tag></tag> not <tag/>.
     for child in elem:
-        if not isinstance(child, etree._Element):
+        if not _is_writable_element(child):
             continue
         if child.text is None:
             child.text = ""
