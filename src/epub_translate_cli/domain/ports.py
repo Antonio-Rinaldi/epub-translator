@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Protocol
 
 from epub_translate_cli.domain.models import (
-    AudioRequest,
-    AudioResponse,
     ChapterDocument,
     RunReport,
     TranslationRequest,
@@ -29,17 +27,6 @@ class TranslatorPort(Protocol):
 
 class ReportWriterPort(Protocol):
     def write(self, report: RunReport, report_path: Path) -> None:
-        raise NotImplementedError
-
-
-class AudioGeneratorPort(Protocol):
-    """Converts text to audio bytes.
-
-    Implementations are completely independent of ``TranslatorPort`` – they
-    use a different model and may use a different backend endpoint.
-    """
-
-    def generate(self, request: AudioRequest) -> AudioResponse:
         raise NotImplementedError
 
 

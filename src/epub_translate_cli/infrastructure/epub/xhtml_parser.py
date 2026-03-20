@@ -150,7 +150,12 @@ class XHTMLTranslator:
     settings: TranslationSettings
 
     def translate_chapter(self, chapter: ChapterDocument) -> tuple[bytes, ChapterTranslationResult]:
-        parser = etree.XMLParser(recover=True, resolve_entities=False)
+        # resolve_entities=True: expand named HTML entities (&mdash; → —, etc.)
+        # at parse time so they become plain Unicode text nodes.  Without this,
+        # lxml keeps them as _Entity nodes that (a) have a read-only .text and
+        # (b) are re‑serialised as bare &mdash; without an HTML DOCTYPE, causing
+        # "Entity 'mdash' not defined" errors in strict XML renderers.
+        parser = etree.XMLParser(recover=True, resolve_entities=True)
         root = etree.fromstring(chapter.xhtml_bytes, parser=parser)
 
         # Build a short context from the whole document text.
