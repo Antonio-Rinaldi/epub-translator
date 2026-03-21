@@ -221,3 +221,23 @@ def test_full_text_preserved_across_slots() -> None:
     # Reconstruct all text from the paragraph using itertext.
     full = "".join(t for t in p.itertext()).strip()
     assert full == translated
+
+
+def test_non_xml_named_entity_is_normalized() -> None:
+    """Named HTML entities like &mdash; must not leak into XML output."""
+    xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
+    <html xmlns='http://www.w3.org/1999/xhtml'>
+      <body>
+        <p>Hello &mdash; world.</p>
+      </body>
+    </html>"""
+
+    updated, root = _translate_chapter(xhtml, "Ciao mondo.")
+    updated_text = updated.decode("utf-8")
+
+    assert "&mdash;" not in updated_text
+    # Output must still be strict-XML parseable.
+    etree.fromstring(updated, parser=etree.XMLParser(recover=False, resolve_entities=False))
+
+    p = root.xpath("//*[local-name()='p']")[0]
+    assert "Ciao" in "".join(p.itertext())

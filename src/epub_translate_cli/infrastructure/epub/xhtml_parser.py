@@ -27,6 +27,26 @@ logger = create_logger(__name__)
 # Regex to strip ``<<<`` / ``>>>`` fence markers the model might echo.
 _FENCE_RE = re.compile(r"^<<<\s*|\s*>>>$")
 
+# Common HTML named entities often found in EPUB XHTML that are not predefined
+# XML entities. Convert them to numeric character references before XML parse.
+_HTML_ENTITY_TO_NUMERIC: dict[bytes, bytes] = {
+    b"&nbsp;": b"&#160;",
+    b"&ndash;": b"&#8211;",
+    b"&mdash;": b"&#8212;",
+    b"&lsquo;": b"&#8216;",
+    b"&rsquo;": b"&#8217;",
+    b"&ldquo;": b"&#8220;",
+    b"&rdquo;": b"&#8221;",
+    b"&hellip;": b"&#8230;",
+}
+
+
+def _normalize_non_xml_entities(xhtml_bytes: bytes) -> bytes:
+    normalized = xhtml_bytes
+    for src, dst in _HTML_ENTITY_TO_NUMERIC.items():
+        normalized = normalized.replace(src, dst)
+    return normalized
+
 # ---------------------------------------------------------------------------
 # Text-slot helpers
 # ---------------------------------------------------------------------------
@@ -156,7 +176,8 @@ class XHTMLTranslator:
         # (b) are re‑serialised as bare &mdash; without an HTML DOCTYPE, causing
         # "Entity 'mdash' not defined" errors in strict XML renderers.
         parser = etree.XMLParser(recover=True, resolve_entities=True)
-        root = etree.fromstring(chapter.xhtml_bytes, parser=parser)
+        normalized_xhtml = _normalize_non_xml_entities(chapter.xhtml_bytes)
+        root = etree.fromstring(normalized_xhtml, parser=parser)
 
         # Build a short context from the whole document text.
         # Keep it small (500 chars) to reduce LLM confusion/context echo.
