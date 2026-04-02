@@ -72,3 +72,4 @@ class TestSanitiseResponse:
         # The regex strips everything up to the marker; if nothing is left
         # it falls back to the original text.
         assert result == "TEXT TO TRANSLATE:"
+
