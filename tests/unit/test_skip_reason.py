@@ -10,6 +10,15 @@ def _parse(xml: str) -> etree._Element:
     return etree.fromstring(xml.encode("utf-8"), parser=parser)
 
 
+def _first(root: etree._Element, query: str) -> etree._Element:
+    """Return first XPath element with runtime guard for strict typing."""
+    matches = root.xpath(query)
+    assert isinstance(matches, list) and matches
+    node = matches[0]
+    assert isinstance(node, etree._Element)
+    return node
+
+
 def test_translates_links() -> None:
     """Links are now translated — they should NOT be skipped."""
     root = _parse(
@@ -20,7 +29,7 @@ def test_translates_links() -> None:
           </body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) is None
 
 
@@ -34,7 +43,7 @@ def test_translates_footnotes() -> None:
           </body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) is None
 
 
@@ -47,7 +56,7 @@ def test_skips_code() -> None:
           </body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) == "protected_code"
 
 
@@ -59,7 +68,7 @@ def test_skips_head_metadata() -> None:
           <body></body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) == "protected_metadata"
 
 
@@ -72,7 +81,7 @@ def test_skips_inline_code() -> None:
           </body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) == "protected_code"
 
 
@@ -85,5 +94,18 @@ def test_no_skip_for_plain_paragraph() -> None:
           </body>
         </html>"""
     )
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _first(root, "//*[local-name()='p']")
     assert _skip_reason(p) is None
+
+
+def test_no_skip_for_heading() -> None:
+    root = _parse(
+        """<?xml version='1.0' encoding='utf-8'?>
+        <html xmlns='http://www.w3.org/1999/xhtml'>
+          <body>
+            <h2>Chapter title</h2>
+          </body>
+        </html>"""
+    )
+    heading = _first(root, "//*[local-name()='h2']")
+    assert _skip_reason(heading) is None

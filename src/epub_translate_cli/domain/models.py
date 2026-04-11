@@ -3,9 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+TranslatableTag = Literal["p", "h1", "h2", "h3", "h4", "h5", "h6"]
+DEFAULT_TRANSLATABLE_TAGS: tuple[TranslatableTag, ...] = (
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+)
+
 
 @dataclass(frozen=True)
 class TranslationSettings:
+    """Runtime settings controlling translation behavior for one run."""
+
     source_lang: str
     target_lang: str
     model: str
@@ -30,12 +43,26 @@ class ParagraphNodeRef:
 
 @dataclass(frozen=True)
 class ChapterDocument:
+    """Chapter XHTML resource extracted from the EPUB archive."""
+
     path: str
     xhtml_bytes: bytes
 
 
 @dataclass(frozen=True)
+class TranslatableNode:
+    """Resolved translatable node payload used by chapter parser pipeline."""
+
+    chapter_path: str
+    node_path: str
+    tag: TranslatableTag
+    source_text: str
+
+
+@dataclass(frozen=True)
 class TranslationRequest:
+    """Input payload passed to translator adapters."""
+
     source_lang: str
     target_lang: str
     model: str
@@ -47,6 +74,8 @@ class TranslationRequest:
 
 @dataclass(frozen=True)
 class TranslationResponse:
+    """Output payload returned by translator adapters."""
+
     translated_text: str
 
 
@@ -59,6 +88,8 @@ SkipReason = Literal[
 
 @dataclass(frozen=True)
 class NodeChange:
+    """One successfully translated node diff entry for reporting."""
+
     chapter_path: str
     node_path: str
     before: str
@@ -67,6 +98,8 @@ class NodeChange:
 
 @dataclass(frozen=True)
 class NodeFailure:
+    """One failed node translation entry for reporting."""
+
     chapter_path: str
     node_path: str
     text: str
@@ -77,6 +110,8 @@ class NodeFailure:
 
 @dataclass(frozen=True)
 class NodeSkip:
+    """One skipped node entry describing why translation was not attempted."""
+
     chapter_path: str
     node_path: str
     reason: SkipReason
@@ -84,6 +119,8 @@ class NodeSkip:
 
 @dataclass
 class ChapterReport:
+    """Per-chapter report section used in final run report."""
+
     chapter_path: str
     changes: list[NodeChange]
     failures: list[NodeFailure]
@@ -92,6 +129,8 @@ class ChapterReport:
 
 @dataclass
 class RunReport:
+    """Aggregate translation report serialized after each run."""
+
     input_path: str
     output_path: str
     report_path: str
@@ -105,6 +144,7 @@ class RunReport:
     chapters: list[ChapterReport]
 
     def totals(self) -> dict[str, Any]:
+        """Compute aggregate counters across all chapter report sections."""
         return {
             "chapters": len(self.chapters),
             "changed": sum(len(c.changes) for c in self.chapters),
@@ -115,6 +155,8 @@ class RunReport:
 
 @dataclass(frozen=True)
 class TranslationRunResult:
+    """Result envelope returned by the orchestrator to CLI layer."""
+
     output_written: bool
     failures: int
     exit_code: int

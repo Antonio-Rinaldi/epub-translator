@@ -5,8 +5,18 @@ from pathlib import Path
 
 from epub_translate_cli.application.services.translation_orchestrator import TranslationOrchestrator
 from epub_translate_cli.domain.errors import RetryableTranslationError
-from epub_translate_cli.domain.models import TranslationRequest, TranslationResponse, TranslationSettings
-from epub_translate_cli.domain.ports import EpubBook, EpubRepositoryPort, ReportWriterPort, TranslatorPort
+from epub_translate_cli.domain.models import (
+    RunReport,
+    TranslationRequest,
+    TranslationResponse,
+    TranslationSettings,
+)
+from epub_translate_cli.domain.ports import (
+    EpubBook,
+    EpubRepositoryPort,
+    ReportWriterPort,
+    TranslatorPort,
+)
 
 
 @dataclass(frozen=True)
@@ -28,23 +38,33 @@ class AlwaysFailTranslator(TranslatorPort):
 
 @dataclass(frozen=True)
 class SinkReportWriter(ReportWriterPort):
-    last = None
+    last: RunReport | None = None
 
-    def write(self, report, report_path: Path) -> None:  # type: ignore[no-untyped-def]
+    def write(self, report: RunReport, report_path: Path) -> None:
         object.__setattr__(self, "last", report)
 
 
 def test_abort_on_error_skips_save(tmp_path: Path) -> None:
     from epub_translate_cli.domain.models import ChapterDocument
 
-    xhtml = b"<?xml version='1.0' encoding='utf-8'?><html xmlns='http://www.w3.org/1999/xhtml'><body><p>Hello</p></body></html>"
-    book = EpubBook(items={"mimetype": b"application/epub+zip", "OEBPS/ch1.xhtml": xhtml}, chapters=[ChapterDocument(path="OEBPS/ch1.xhtml", xhtml_bytes=xhtml)])
+    xhtml = (
+        b"<?xml version='1.0' encoding='utf-8'?><html xmlns='http://www.w3.org/1999/xhtml'>"
+        b"<body><p>Hello</p></body></html>"
+    )
+    book = EpubBook(
+        items={"mimetype": b"application/epub+zip", "OEBPS/ch1.xhtml": xhtml},
+        chapters=[ChapterDocument(path="OEBPS/ch1.xhtml", xhtml_bytes=xhtml)],
+    )
 
     repo = FakeRepo(book=book)
     translator = AlwaysFailTranslator()
     writer = SinkReportWriter()
 
-    orchestrator = TranslationOrchestrator(epub_repository=repo, translator=translator, report_writer=writer)
+    orchestrator = TranslationOrchestrator(
+        epub_repository=repo,
+        translator=translator,
+        report_writer=writer,
+    )
 
     settings = TranslationSettings(
         source_lang="en",

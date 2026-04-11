@@ -1,184 +1,78 @@
 # EPUB Translator CLI Plan
 
-## 1. Goal
-Build a Python CLI that:
-- Reads EPUB from input path
-- Translates paragraph text nodes via Ollama
-- Writes translated EPUB to `--out`
-- Emits JSON report of changes and failures
+## 1. Objective
+Deliver a production-grade CLI that translates EPUB narrative content with Ollama, preserves document structure, and emits a reliable JSON report for auditing and troubleshooting.
 
-## 2. Core Constraints
-- SOLID, DRY, KISS
-- Required CLI flags: `--model`, `--source-lang`, `--target-lang`, `--out`
-- Optional: `--temperature` default value, `--retries` default 3, `--abort-on-error` default false
-- Strategy: read full chapter HTML for context, translate paragraph-level text nodes
-- Preserve structure as much as possible, allow minor normalization
-- Never modify link text or URL targets, footnotes, code blocks, and metadata nodes
+## 2. Current Baseline (Implemented)
+- Translation scope includes `p` and heading tags `h1`-`h6`.
+- Layered architecture is in place (`domain`, `application`, `infrastructure`) with port-based adapters.
+- `TranslationOrchestrator` acts as facade and coordinates repository, parser, translator, and report writer.
+- CLI uses a command-style input model and explicit validation/build steps.
+- Inline formatting preservation uses text-slot collection and proportional redistribution.
+- Retry/backoff and abort policy (`--abort-on-error`) are implemented.
+- Unit suite covers parser behavior, skip rules, sanitization, and orchestrator abort semantics.
 
-## 3. Proposed Project Structure
+## 3. Architecture Snapshot
 
-```python
-src/
-  epub_translate_cli/
-    __init__.py
-    main.py
-    cli.py
-    application/
-      services/
-        translation_orchestrator.py
-    domain/
-      models.py
-      ports.py
-      errors.py
-    infrastructure/
-      epub/
-        epub_reader.py
-        xhtml_parser.py
-        epub_writer.py
-      llm/
-        ollama_client.py
-      reporting/
-        json_report_writer.py
-      logging/
-        logger_factory.py
-tests/
-  unit/
-  integration/
+```text
+src/epub_translate_cli/
+  cli.py
+  main.py
+  application/services/translation_orchestrator.py
+  domain/{models.py,ports.py,errors.py}
+  infrastructure/
+    epub/{epub_repository.py,xhtml_parser.py}
+    llm/ollama_translator.py
+    reporting/json_report_writer.py
+    logging/logger_factory.py
+tests/unit/
+  test_orchestrator_abort_on_error.py
+  test_preserve_inline_formatting.py
+  test_sanitise_response.py
+  test_skip_reason.py
 ```
 
-## 4. SOLID Design
-- Single Responsibility:
-  - EPUB read/write isolated from translation
-  - LLM calls isolated from parsing
-  - Reporting isolated from workflow
-- Open/Closed:
-  - New LLM providers via `TranslatorPort`
-  - New output reporters via `ReportWriterPort`
-- Liskov:
-  - Any `TranslatorPort` implementation can replace Ollama client
-- Interface Segregation:
-  - Separate ports for translation, EPUB IO, reporting
-- Dependency Inversion:
-  - Orchestrator depends on interfaces, not concrete classes
+## 4. Runtime Pipeline (As-Built)
+1. CLI validates flags and builds immutable translation command/settings.
+2. Repository loads EPUB item map and chapter documents.
+3. Each chapter is parsed; translatable nodes are selected (`p`, `h1`-`h6`).
+4. Protected/empty nodes are skipped with explicit skip reasons.
+5. Translator request includes source text plus chapter/rolling context.
+6. Ollama adapter builds prompt, performs HTTP call, retries retryable errors, sanitizes response.
+7. Parser applies translated text while preserving inline element ownership.
+8. Report aggregates changes, skips, failures, totals.
+9. If failures exist and `--abort-on-error=true`, EPUB write is skipped and exit code is `2`; otherwise output EPUB is saved.
 
-## 5. Domain Ports and Models
-- Ports:
-  - `EpubRepositoryPort`: load chapters, save translated book
-  - `TranslatorPort`: translate text with context and settings
-  - `ReportWriterPort`: write run report JSON
-- Models:
-  - `ChapterDocument`
-  - `ParagraphNode`
-  - `TranslationRequest`
-  - `TranslationResult`
-  - `NodeChange`
-  - `NodeFailure`
-  - `RunReport`
+## 5. Safety And Content Rules
+- Skip protected code/metadata regions (`code`, `pre`, `head`, `title`, `style`, `script`).
+- Preserve XHTML validity and avoid malformed/self-closing inline artifacts.
+- Keep href/attribute structure intact; only textual node payload is translated.
+- Keep deterministic error taxonomy (`RetryableTranslationError`, validation/runtime categories) for report stability.
 
-## 6. Processing Pipeline
-1. Validate CLI inputs and file paths
-2. Load EPUB and discover translatable chapter XHTML
-3. For each chapter:
-   - Parse full HTML DOM
-   - Build chapter context summary text
-   - Locate paragraph-level text nodes
-4. For each paragraph node:
-   - Apply eligibility filter before translation
-   - Skip node when inside code/pre blocks or metadata containers
-   - Build translation prompt with chapter context and node text
-   - Call Ollama with retry policy
-   - Replace node text on success
-   - Record failure on final error
-5. Persist report JSON
-6. Output behavior:
-   - If `--abort-on-error=true` and failures > 0: do not write EPUB
-   - Else write EPUB to `--out`
+## 6. Quality Gates
+- Lint: `ruff check src tests`
+- Format: `ruff format --check src tests`
+- Typing: `mypy --strict src tests/unit`
+- Tests: `pytest -q tests/unit`
 
-## 7. Ollama Translation Design
-- Request includes:
-  - source language
-  - target language
-  - chapter context excerpt
-  - strict instruction to return translated plain text only
-- Retry:
-  - configurable count, default 3
-  - exponential backoff
-- Error classes:
-  - transient transport/model unavailable
-  - response format invalid
-  - non-retryable client config error
+Status now: passing after strict typing cleanup in report writer and lxml-heavy test helpers.
 
-## 8. JSON Report Schema
-- Top-level:
-  - input path, output path
-  - model, source language, target language, temperature, retries
-  - totals: chapters processed, nodes seen, nodes changed, nodes failed
-  - output written boolean
-- Per chapter:
-  - chapter id/path
-  - changed nodes list
-  - failed nodes list
-- Node change entry:
-  - node id, original excerpt, translated excerpt
-- Node failure entry:
-  - node id, error type, message, attempts
-- Node skip entry:
-  - node id, chapter path, skip reason
+## 7. Next Hardening Milestones
+1. Add integration fixtures for full EPUB round-trip with heading-heavy chapters.
+2. Add contract tests for Ollama adapter HTTP/status/error mapping boundaries.
+3. Add CI workflow with required gates (ruff, mypy strict, pytest unit).
+4. Add coverage threshold and regression snapshot for report schema.
+5. Add benchmark harness for worker scaling and context-window cost.
 
-## 9. CLI UX Spec
-- Command shape:
-  - `epub-translate --in INPUT.epub --out OUTPUT.epub --source-lang xx --target-lang yy --model MODEL`
-- Flags:
-  - `--temperature` default `0.2`
-  - `--retries` default `3`
-  - `--report-out` optional; if missing derive near `--out`
-  - `--abort-on-error` boolean default `false`
-  - `--log-level` default `INFO` (`DEBUG` for deeper diagnostics)
-- Exit codes:
-  - `0` success
-  - `1` validation or runtime failure
-  - `2` completed with failures and aborted output due to `--abort-on-error`
+## 8. Risks To Monitor
+- LLM output drift (prompt leakage or malformed content) under different models.
+- Context-window growth with long chapters causing latency or token pressure.
+- EPUB edge cases (non-standard XHTML/entities) that may bypass skip logic.
+- Parallel processing contention when future shared-state features are introduced.
 
-## 10. Testing Strategy
-- Unit tests:
-  - parser node extraction and replacement
-  - retry policy behavior
-  - orchestrator output policy logic
-  - report generation mapping
-  - eligibility filter for protected nodes and skip reason classification
-- Integration tests:
-  - fixture EPUB round-trip
-  - fake translator deterministic outputs
-  - partial-failure scenario and abort policy
-  - protected content scenario to assert unchanged links, footnotes, code blocks, and metadata nodes
-- Contract tests:
-  - Ollama client response parsing and error mapping
-
-## 11. Coding Standards
-- Tooling:
-  - Ruff lint + format
-  - MyPy strict for core modules
-  - Pytest with coverage threshold
-- Practices:
-  - explicit types for public interfaces
-  - pure functions where possible
-  - no hidden global state
-  - deterministic error messages for reports
-  - logging policy: concise `INFO` milestones, detailed `DEBUG` internals
-
-## 12. Mermaid Flow
-
-```mermaid
-flowchart TD
-  A[Parse CLI args] --> B[Validate input and options]
-  B --> C[Load EPUB chapters]
-  C --> D[Parse chapter HTML]
-  D --> E[Extract paragraph nodes]
-  E --> F[Translate node with Ollama and retries]
-  F --> G[Apply translated text]
-  F --> H[Record failure]
-  G --> I[Update run report]
-  H --> I
-  I --> J{Abort on error and failures exist}
-  J -->|Yes| K[Write report only]
-  J -->|No| L[Write report and output EPUB]
+## 9. Hardening Outcome (2026-04-09)
+- `ruff check src tests`: pass
+- `ruff format --check src tests`: pass
+- `mypy --strict src tests/unit`: pass
+- `pytest -q tests/unit`: pass
+- Remaining `type: ignore` suppressions for this package scope: `0`

@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 
-class EpubTranslateError(Exception):
-    """Base error for this application."""
+class EpubTranslatorError(Exception):
+    """Base domain error for EPUB translation workflows."""
 
 
-class ValidationError(EpubTranslateError):
+# Backward-compatible alias retained for existing imports.
+EpubTranslateError = EpubTranslatorError
+
+
+class ValidationError(EpubTranslatorError):
     """Input validation error."""
 
 
-class EpubReadError(EpubTranslateError):
+class EpubReadError(EpubTranslatorError):
     """EPUB read/unpack/parse error."""
 
 
-class EpubWriteError(EpubTranslateError):
+class EpubWriteError(EpubTranslatorError):
     """EPUB write/pack error."""
 
 
-class TranslationError(EpubTranslateError):
-    """Translation error (may be retryable)."""
+class TranslationError(EpubTranslatorError):
+    """Base error for translation provider failures."""
 
 
 class RetryableTranslationError(TranslationError):

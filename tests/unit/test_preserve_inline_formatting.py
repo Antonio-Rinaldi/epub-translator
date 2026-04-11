@@ -4,7 +4,12 @@ from dataclasses import dataclass
 
 from lxml import etree
 
-from epub_translate_cli.domain.models import ChapterDocument, TranslationRequest, TranslationResponse, TranslationSettings
+from epub_translate_cli.domain.models import (
+    ChapterDocument,
+    TranslationRequest,
+    TranslationResponse,
+    TranslationSettings,
+)
 from epub_translate_cli.domain.ports import TranslatorPort
 from epub_translate_cli.infrastructure.epub.xhtml_parser import (
     XHTMLTranslator,
@@ -32,12 +37,37 @@ _SETTINGS = TranslationSettings(
 )
 
 
+def _xpath_first(root: etree._Element, query: str) -> etree._Element:
+    """Return first element for XPath query with runtime guards for strict typing."""
+    matches = root.xpath(query)
+    assert isinstance(matches, list) and matches
+    first = matches[0]
+    assert isinstance(first, etree._Element)
+    return first
+
+
+def _xpath_elements(root: etree._Element, query: str) -> list[etree._Element]:
+    """Return element-only XPath results."""
+    matches = root.xpath(query)
+    assert isinstance(matches, list)
+    elements = [node for node in matches if isinstance(node, etree._Element)]
+    assert elements
+    return elements
+
+
+def _itertext_str(element: etree._Element) -> str:
+    """Collapse itertext output to text-only content."""
+    return "".join(chunk for chunk in element.itertext() if isinstance(chunk, str)).strip()
+
+
 def _translate_chapter(xhtml: bytes, translated_text: str) -> tuple[bytes, etree._Element]:
     translator = XHTMLTranslator(
         translator=EchoTranslator(translated_text=translated_text),
         settings=_SETTINGS,
     )
-    updated, _ = translator.translate_chapter(ChapterDocument(path="OEBPS/ch1.xhtml", xhtml_bytes=xhtml))
+    updated, _ = translator.translate_chapter(
+        ChapterDocument(path="OEBPS/ch1.xhtml", xhtml_bytes=xhtml)
+    )
     root = etree.fromstring(updated, parser=etree.XMLParser(recover=True, resolve_entities=False))
     return updated, root
 
@@ -45,6 +75,7 @@ def _translate_chapter(xhtml: bytes, translated_text: str) -> tuple[bytes, etree
 # ---------------------------------------------------------------------------
 # Unit tests for slot helpers
 # ---------------------------------------------------------------------------
+
 
 def test_collect_text_slots_plain_paragraph() -> None:
     """Plain paragraph – only elem.text slot."""
@@ -72,8 +103,8 @@ def test_collect_text_slots_mixed() -> None:
     em = list(elem)[0]
     slots = _collect_text_slots(elem)
     owners = [o for o, _ in slots]
-    assert elem in owners       # p.text = "Lead "
-    assert em in owners         # em.text = "italic", em.tail = " tail text."
+    assert elem in owners  # p.text = "Lead "
+    assert em in owners  # em.text = "italic", em.tail = " tail text."
 
 
 def test_distribute_text_single_slot() -> None:
@@ -123,6 +154,7 @@ def test_nearest_word_boundary_at_end() -> None:
 # Integration tests via _translate_chapter
 # ---------------------------------------------------------------------------
 
+
 def test_no_self_closing_tags_dropcap() -> None:
     """Dropcap span must not produce a self-closing tag."""
     xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
@@ -138,7 +170,7 @@ def test_no_self_closing_tags_dropcap() -> None:
     assert "<span/>" not in updated_text
     assert "<span />" not in updated_text
 
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _xpath_first(root, "//*[local-name()='p']")
     children = list(p)
     assert len(children) == 1
     assert children[0].get("class") == "dropcap"
@@ -155,7 +187,7 @@ def test_translate_plain_paragraph_no_children() -> None:
 
     _, root = _translate_chapter(xhtml, "Ciao mondo.")
 
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _xpath_first(root, "//*[local-name()='p']")
     assert p.text == "Ciao mondo."
     assert len(list(p)) == 0
 
@@ -171,7 +203,7 @@ def test_translate_preserves_paragraph_class() -> None:
 
     updated, root = _translate_chapter(xhtml, "Del testo con enfasi qui.")
 
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _xpath_first(root, "//*[local-name()='p']")
     assert p.get("class") == "calibre3"
     # em child must still be present with its class.
     children = list(p)
@@ -198,7 +230,7 @@ def test_no_self_closing_tags_in_calibre_epub() -> None:
     assert "<em/>" not in updated_text
     assert "<a/>" not in updated_text
 
-    paras = root.xpath("//*[local-name()='p']")
+    paras = _xpath_elements(root, "//*[local-name()='p']")
     classes = [p.get("class") for p in paras]
     assert "ct" in classes
     assert "cotx" in classes
@@ -217,9 +249,9 @@ def test_full_text_preserved_across_slots() -> None:
     translated = "È un fatto della natura umana."
     updated, root = _translate_chapter(xhtml, translated)
 
-    p = root.xpath("//*[local-name()='p']")[0]
+    p = _xpath_first(root, "//*[local-name()='p']")
     # Reconstruct all text from the paragraph using itertext.
-    full = "".join(t for t in p.itertext()).strip()
+    full = _itertext_str(p)
     assert full == translated
 
 
@@ -239,5 +271,19 @@ def test_non_xml_named_entity_is_normalized() -> None:
     # Output must still be strict-XML parseable.
     etree.fromstring(updated, parser=etree.XMLParser(recover=False, resolve_entities=False))
 
-    p = root.xpath("//*[local-name()='p']")[0]
-    assert "Ciao" in "".join(p.itertext())
+    p = _xpath_first(root, "//*[local-name()='p']")
+    assert "Ciao" in _itertext_str(p)
+
+
+def test_translates_heading_tags_not_only_paragraphs() -> None:
+    xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
+    <html xmlns='http://www.w3.org/1999/xhtml'>
+      <body>
+        <h1><span>THE NETHERLANDS</span></h1>
+      </body>
+    </html>"""
+
+    _, root = _translate_chapter(xhtml, "I PAESI BASSI")
+
+    heading = _xpath_first(root, "//*[local-name()='h1']")
+    assert _itertext_str(heading) == "I PAESI BASSI"

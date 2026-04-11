@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-import pytest
+from contextlib import AbstractContextManager
+from typing import Protocol
 
 from epub_translate_cli.infrastructure.llm.ollama_translator import _sanitise_response
+
+
+class _CapLogFixture(Protocol):
+    text: str
+
+    def at_level(self, level: int) -> AbstractContextManager[object]: ...
 
 
 class TestSanitiseResponse:
@@ -31,12 +38,7 @@ class TestSanitiseResponse:
         assert result == "Capitolo 1"
 
     def test_strips_leaked_italian_marker(self) -> None:
-        raw = (
-            "CONTESTO DEL CAPITOLO:\n"
-            "Qualche contesto...\n\n"
-            "TESTO DA TRADURRE:\n"
-            "I Paesi Bassi"
-        )
+        raw = "CONTESTO DEL CAPITOLO:\nQualche contesto...\n\nTESTO DA TRADURRE:\nI Paesi Bassi"
         result = _sanitise_response(raw, "THE NETHERLANDS")
         assert result == "I Paesi Bassi"
 
@@ -45,7 +47,7 @@ class TestSanitiseResponse:
         result = _sanitise_response(raw, "Chapter 1")
         assert result == "Capitolo 1"
 
-    def test_warns_on_excessive_length_ratio(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_warns_on_excessive_length_ratio(self, caplog: _CapLogFixture) -> None:
         import logging
 
         long_response = "A" * 1000
@@ -54,7 +56,7 @@ class TestSanitiseResponse:
         assert result == long_response  # kept but warned
         assert "possible context leak" in caplog.text.lower()
 
-    def test_no_warning_for_normal_ratio(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_no_warning_for_normal_ratio(self, caplog: _CapLogFixture) -> None:
         import logging
 
         with caplog.at_level(logging.WARNING):
@@ -72,4 +74,3 @@ class TestSanitiseResponse:
         # The regex strips everything up to the marker; if nothing is left
         # it falls back to the original text.
         assert result == "TEXT TO TRANSLATE:"
-

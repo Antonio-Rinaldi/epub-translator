@@ -4,23 +4,28 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import cast
 
 from lxml import etree
 
-from epub_translate_cli.domain.errors import NonRetryableTranslationError, RetryableTranslationError
+from epub_translate_cli.domain.errors import (
+    NonRetryableTranslationError,
+    RetryableTranslationError,
+)
 from epub_translate_cli.domain.models import (
+    DEFAULT_TRANSLATABLE_TAGS,
     ChapterDocument,
     NodeChange,
     NodeFailure,
     NodeSkip,
     SkipReason,
+    TranslatableNode,
+    TranslatableTag,
     TranslationRequest,
     TranslationSettings,
 )
 from epub_translate_cli.domain.ports import TranslatorPort
 from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
-
 
 logger = create_logger(__name__)
 
@@ -40,21 +45,33 @@ _HTML_ENTITY_TO_NUMERIC: dict[bytes, bytes] = {
     b"&hellip;": b"&#8230;",
 }
 
+# Node types whose .text attribute is read-only (they are _Element subclasses
+# in lxml but only hold content, not writable text slots).
+_CONTENT_ONLY_TYPES = (etree._Entity, etree._Comment, etree._ProcessingInstruction)
+_TRANSLATABLE_TAG_SET = frozenset(DEFAULT_TRANSLATABLE_TAGS)
+
+
+@dataclass(frozen=True)
+class ChapterTranslationResult:
+    """Per-chapter translation processing report."""
+
+    changes: list[NodeChange]
+    failures: list[NodeFailure]
+    skips: list[NodeSkip]
+
 
 def _normalize_non_xml_entities(xhtml_bytes: bytes) -> bytes:
+    """Replace non-XML named entities with numeric references before parsing."""
     normalized = xhtml_bytes
     for src, dst in _HTML_ENTITY_TO_NUMERIC.items():
         normalized = normalized.replace(src, dst)
     return normalized
 
-# ---------------------------------------------------------------------------
-# Text-slot helpers
-# ---------------------------------------------------------------------------
 
-
-# Node types whose .text attribute is read-only (they are _Element subclasses
-# in lxml but only hold content, not writable text slots).
-_CONTENT_ONLY_TYPES = (etree._Entity, etree._Comment, etree._ProcessingInstruction)
+def _translatable_xpath(tags: tuple[TranslatableTag, ...]) -> str:
+    """Build local-name XPath predicate for the configured translatable tags."""
+    predicates = " or ".join(f"local-name()='{tag}'" for tag in tags)
+    return f"//*[{predicates}]"
 
 
 def _is_writable_element(node: etree._Element) -> bool:
@@ -63,19 +80,7 @@ def _is_writable_element(node: etree._Element) -> bool:
 
 
 def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]]:
-    """Return all non-empty text slots in document order as (element, attr) pairs.
-
-    lxml stores inline text in two places per element:
-    * ``elem.text``  – text **before** the first child (or sole text content)
-    * ``child.tail`` – text **after** the child element but still inside ``elem``
-
-    We only include slots that contributed characters to the source text so
-    that we distribute the translation faithfully.
-
-    Note: ``_Entity``, ``_Comment``, and ``_ProcessingInstruction`` are all
-    subclasses of ``_Element`` in lxml but their ``.text`` attribute is
-    read-only, so they must be filtered out explicitly.
-    """
+    """Return all non-empty text slots in document order as (element, attr) pairs."""
     slots: list[tuple[etree._Element, str]] = []
     if elem.text:
         slots.append((elem, "text"))
@@ -90,13 +95,7 @@ def _collect_text_slots(elem: etree._Element) -> list[tuple[etree._Element, str]
 
 
 def _distribute_text(translated: str, slot_lengths: list[int]) -> list[str]:
-    """Split *translated* into len(slot_lengths) chunks proportional to
-    *slot_lengths*, snapping each split point to the nearest word boundary.
-
-    If there is only one slot, the whole string is returned as-is.
-    If the translated string is shorter than the number of slots, excess
-    slots get empty strings.
-    """
+    """Split translated text proportionally across source text slots."""
     if not slot_lengths:
         return []
     if len(slot_lengths) == 1:
@@ -104,222 +103,289 @@ def _distribute_text(translated: str, slot_lengths: list[int]) -> list[str]:
 
     total_orig = sum(slot_lengths)
     if total_orig == 0:
-        # Edge case: all slots had zero length — put everything in the first.
         return [translated] + [""] * (len(slot_lengths) - 1)
 
     result: list[str] = []
     remaining = translated
     remaining_weight = total_orig
 
-    for i, weight in enumerate(slot_lengths[:-1]):
+    for weight in slot_lengths[:-1]:
         if not remaining:
             result.append("")
             continue
 
-        # Ideal split position (proportional).
         ideal = round(len(remaining) * weight / remaining_weight)
         ideal = max(0, min(ideal, len(remaining)))
-
-        # Snap to the nearest word boundary (prefer not to split a word).
         split_pos = _nearest_word_boundary(remaining, ideal)
 
         result.append(remaining[:split_pos])
-        # Do NOT lstrip — leading spaces belong to the next slot.
         remaining = remaining[split_pos:]
         remaining_weight -= weight
 
-    # Last chunk gets everything that's left.
     result.append(remaining)
     return result
 
 
 def _nearest_word_boundary(text: str, pos: int) -> int:
-    """Return the index of the nearest word boundary to *pos* in *text*.
-
-    Prefers the boundary immediately after *pos*; falls back to the one
-    immediately before it; falls back to *pos* itself if no whitespace found.
-    """
+    """Return the nearest split position around ``pos`` that avoids breaking words."""
     if pos >= len(text):
         return len(text)
     if pos == 0:
         return 0
 
-    # Search forward for whitespace.
-    fwd = pos
-    while fwd < len(text) and not text[fwd].isspace():
-        fwd += 1
+    forward = pos
+    while forward < len(text) and not text[forward].isspace():
+        forward += 1
 
-    # Search backward for whitespace.
-    bwd = pos - 1
-    while bwd > 0 and not text[bwd].isspace():
-        bwd -= 1
+    backward = pos - 1
+    while backward > 0 and not text[backward].isspace():
+        backward -= 1
 
-    # Choose closest; prefer forward on a tie.
-    dist_fwd = fwd - pos
-    dist_bwd = pos - bwd
-
-    if dist_fwd <= dist_bwd:
-        return fwd
-    else:
-        return bwd + 1  # +1: include the space in the previous chunk
+    return forward if (forward - pos) <= (pos - backward) else backward + 1
 
 
 @dataclass(frozen=True)
 class XHTMLTranslator:
+    """Translate chapter XHTML while preserving inline formatting structure."""
+
     translator: TranslatorPort
     settings: TranslationSettings
+    translatable_tags: tuple[TranslatableTag, ...] = DEFAULT_TRANSLATABLE_TAGS
 
     def translate_chapter(self, chapter: ChapterDocument) -> tuple[bytes, ChapterTranslationResult]:
-        # resolve_entities=True: expand named HTML entities (&mdash; → —, etc.)
-        # at parse time so they become plain Unicode text nodes.  Without this,
-        # lxml keeps them as _Entity nodes that (a) have a read-only .text and
-        # (b) are re‑serialised as bare &mdash; without an HTML DOCTYPE, causing
-        # "Entity 'mdash' not defined" errors in strict XML renderers.
+        """Translate one chapter and return updated XHTML bytes plus chapter report."""
+        root = self._parse_root(chapter.xhtml_bytes)
+        chapter_context = self._chapter_context(root)
+        report = self._translate_nodes(root, chapter.path, chapter_context)
+        updated = etree.tostring(root, encoding="utf-8", xml_declaration=True)
+        return updated, report
+
+    @staticmethod
+    def _parse_root(xhtml_bytes: bytes) -> etree._Element:
+        """Parse XHTML bytes into an lxml root with robust entity handling."""
         parser = etree.XMLParser(recover=True, resolve_entities=True)
-        normalized_xhtml = _normalize_non_xml_entities(chapter.xhtml_bytes)
-        root = etree.fromstring(normalized_xhtml, parser=parser)
+        normalized_xhtml = _normalize_non_xml_entities(xhtml_bytes)
+        return etree.fromstring(normalized_xhtml, parser=parser)
 
-        # Build a short context from the whole document text.
-        # Keep it small (500 chars) to reduce LLM confusion/context echo.
-        full_text = " ".join(t.strip() for t in root.itertext() if t and t.strip())
-        chapter_context = _limit(full_text, 500)
+    @staticmethod
+    def _chapter_context(root: etree._Element) -> str:
+        """Build short chapter context used only for translation guidance."""
+        full_text = " ".join(str(text).strip() for text in root.itertext() if str(text).strip())
+        return _limit(full_text, 500)
 
+    def _translate_nodes(
+        self,
+        root: etree._Element,
+        chapter_path: str,
+        chapter_context: str,
+    ) -> ChapterTranslationResult:
+        """Translate all eligible nodes and build chapter report sections."""
         changes: list[NodeChange] = []
         failures: list[NodeFailure] = []
         skips: list[NodeSkip] = []
 
-        # Rolling window of the last N successfully translated paragraph texts.
-        # Used as prior-context for the next paragraph request so the LLM
-        # can maintain consistent tone and terminology within a chapter.
-        n_ctx = self.settings.context_paragraphs
-        recent_translations: deque[str] = deque(maxlen=n_ctx if n_ctx > 0 else 1)
+        context_size = self.settings.context_paragraphs
+        recent_translations: deque[str] = deque(maxlen=context_size if context_size > 0 else 1)
 
-        for elem in root.xpath("//*[local-name()='p']"):
-            node_path = root.getroottree().getpath(elem)
-
+        for elem, node in self._candidate_nodes(root, chapter_path):
             reason = _skip_reason(elem)
             if reason is not None:
-                skips.append(NodeSkip(chapter_path=chapter.path, node_path=node_path, reason=reason))
+                skips.append(self._skip_entry(node, reason))
+                continue
+            if not node.source_text:
+                skips.append(self._skip_entry(node, "empty"))
                 continue
 
-            before = "".join(elem.itertext()).strip()
-            if not before:
-                skips.append(NodeSkip(chapter_path=chapter.path, node_path=node_path, reason="empty"))
-                continue
-
-            # Build prior-translation context string from the rolling window.
-            prior_translations = (
-                "\n".join(recent_translations) if n_ctx > 0 and recent_translations else ""
-            )
-
-            request = TranslationRequest(
-                source_lang=self.settings.source_lang,
-                target_lang=self.settings.target_lang,
-                model=self.settings.model,
-                temperature=self.settings.temperature,
+            translated, attempts, error = self._translate_node(
+                elem=elem,
+                node=node,
                 chapter_context=chapter_context,
-                text=before,
-                prior_translations=prior_translations,
+                prior_translations=self._prior_translations(recent_translations, context_size),
             )
-
-            translated: Optional[str] = None
-            attempts = 0
-            last_error: Optional[Exception] = None
-
-            for attempt in range(self.settings.retries + 1):
-                attempts = attempt + 1
-                try:
-                    raw = self.translator.translate(request).translated_text
-                    # Strip any ``<<<``/``>>>`` fences the model may echo.
-                    translated = _FENCE_RE.sub("", raw).strip()
-                    break
-                except RetryableTranslationError as exc:
-                    last_error = exc
-                    logger.debug(
-                        "Retryable translation error | chapter=%s node=%s attempt=%s/%s error=%s",
-                        chapter.path,
-                        node_path,
-                        attempts,
-                        self.settings.retries + 1,
-                        str(exc),
-                    )
-                    time.sleep(_backoff_seconds(attempt))
-                except NonRetryableTranslationError as exc:
-                    last_error = exc
-                    logger.debug(
-                        "Non-retryable translation error | chapter=%s node=%s attempt=%s error=%s",
-                        chapter.path,
-                        node_path,
-                        attempts,
-                        str(exc),
-                    )
-                    break
 
             if translated is None:
-                failures.append(
-                    NodeFailure(
-                        chapter_path=chapter.path,
-                        node_path=node_path,
-                        text=_limit(before, 200),
-                        error_type=type(last_error).__name__ if last_error else "UnknownError",
-                        message=str(last_error) if last_error else "unknown",
-                        attempts=attempts,
-                    )
-                )
+                failures.append(self._failure_entry(node, error, attempts))
                 continue
 
-            # Replace text while preserving inline tags/attributes (e.g., spans with font-size styles).
-            _replace_element_text(elem, translated)
-
-            logger.debug("Translated node | chapter=%s node=%s", chapter.path, node_path)
-
-            changes.append(
-                NodeChange(
-                    chapter_path=chapter.path,
-                    node_path=node_path,
-                    before=_limit(before, 200),
-                    after=_limit(translated, 200),
-                )
+            changes.append(self._change_entry(node, translated))
+            logger.debug(
+                "Translated node | chapter=%s node=%s tag=%s",
+                chapter_path,
+                node.node_path,
+                node.tag,
             )
-
-            # Add this translation to the rolling context window.
-            if n_ctx > 0:
+            if context_size > 0:
                 recent_translations.append(translated)
 
-        updated = etree.tostring(root, encoding="utf-8", xml_declaration=True)
-        return updated, ChapterTranslationResult(changes=changes, failures=failures, skips=skips)
+        return ChapterTranslationResult(changes=changes, failures=failures, skips=skips)
+
+    def _candidate_nodes(
+        self,
+        root: etree._Element,
+        chapter_path: str,
+    ) -> list[tuple[etree._Element, TranslatableNode]]:
+        """Collect translatable node candidates in document order."""
+        xpath = _translatable_xpath(self.translatable_tags)
+        raw_nodes = root.xpath(xpath)
+        if not isinstance(raw_nodes, list):
+            return []
+
+        def _to_node(elem: etree._Element) -> tuple[etree._Element, TranslatableNode] | None:
+            """Convert one lxml element into typed translatable node payload when eligible."""
+            if not isinstance(elem.tag, str):
+                return None
+            local_tag = etree.QName(elem.tag).localname.lower()
+            if local_tag not in _TRANSLATABLE_TAG_SET:
+                return None
+            node = TranslatableNode(
+                chapter_path=chapter_path,
+                node_path=root.getroottree().getpath(elem),
+                tag=cast(TranslatableTag, local_tag),
+                source_text="".join(str(text) for text in elem.itertext()).strip(),
+            )
+            return elem, node
+
+        return [
+            item
+            for item in (_to_node(elem) for elem in raw_nodes if isinstance(elem, etree._Element))
+            if item is not None
+        ]
+
+    @staticmethod
+    def _prior_translations(window: deque[str], context_size: int) -> str:
+        """Build prior translation context block from rolling window."""
+        if context_size <= 0 or not window:
+            return ""
+        return "\n".join(window)
+
+    def _translation_request(
+        self,
+        chapter_context: str,
+        source_text: str,
+        prior_translations: str,
+    ) -> TranslationRequest:
+        """Create translation request payload for one source node text."""
+        return TranslationRequest(
+            source_lang=self.settings.source_lang,
+            target_lang=self.settings.target_lang,
+            model=self.settings.model,
+            temperature=self.settings.temperature,
+            chapter_context=chapter_context,
+            text=source_text,
+            prior_translations=prior_translations,
+        )
+
+    def _translate_node(
+        self,
+        *,
+        elem: etree._Element,
+        node: TranslatableNode,
+        chapter_context: str,
+        prior_translations: str,
+    ) -> tuple[str | None, int, Exception | None]:
+        """Translate one node and apply translated text in place when successful."""
+        request = self._translation_request(chapter_context, node.source_text, prior_translations)
+        translated, attempts, error = self._translate_with_retries(
+            request,
+            node.chapter_path,
+            node.node_path,
+        )
+        if translated is not None:
+            _replace_element_text(elem, translated)
+        return translated, attempts, error
+
+    def _translate_with_retries(
+        self,
+        request: TranslationRequest,
+        chapter_path: str,
+        node_path: str,
+    ) -> tuple[str | None, int, Exception | None]:
+        """Translate request with retry policy and return translated text or failure metadata."""
+        attempts = 0
+        last_error: Exception | None = None
+
+        for attempt in range(self.settings.retries + 1):
+            attempts = attempt + 1
+            try:
+                raw = self.translator.translate(request).translated_text
+                return _FENCE_RE.sub("", raw).strip(), attempts, None
+            except RetryableTranslationError as exc:
+                last_error = exc
+                logger.debug(
+                    "Retryable translation error | chapter=%s node=%s attempt=%s/%s error=%s",
+                    chapter_path,
+                    node_path,
+                    attempts,
+                    self.settings.retries + 1,
+                    str(exc),
+                )
+                time.sleep(_backoff_seconds(attempt))
+            except NonRetryableTranslationError as exc:
+                last_error = exc
+                logger.debug(
+                    "Non-retryable translation error | chapter=%s node=%s attempt=%s error=%s",
+                    chapter_path,
+                    node_path,
+                    attempts,
+                    str(exc),
+                )
+                break
+
+        return None, attempts, last_error
+
+    @staticmethod
+    def _skip_entry(node: TranslatableNode, reason: SkipReason) -> NodeSkip:
+        """Build skip report entry for one node."""
+        return NodeSkip(chapter_path=node.chapter_path, node_path=node.node_path, reason=reason)
+
+    @staticmethod
+    def _change_entry(node: TranslatableNode, translated_text: str) -> NodeChange:
+        """Build change report entry for one successful node translation."""
+        return NodeChange(
+            chapter_path=node.chapter_path,
+            node_path=node.node_path,
+            before=_limit(node.source_text, 200),
+            after=_limit(translated_text, 200),
+        )
+
+    @staticmethod
+    def _failure_entry(
+        node: TranslatableNode,
+        error: Exception | None,
+        attempts: int,
+    ) -> NodeFailure:
+        """Build failure report entry for one unsuccessful node translation."""
+        return NodeFailure(
+            chapter_path=node.chapter_path,
+            node_path=node.node_path,
+            text=_limit(node.source_text, 200),
+            error_type=type(error).__name__ if error else "UnknownError",
+            message=str(error) if error else "unknown",
+            attempts=attempts,
+        )
 
 
-@dataclass(frozen=True)
-class ChapterTranslationResult:
-    changes: list[NodeChange]
-    failures: list[NodeFailure]
-    skips: list[NodeSkip]
-
-
-_PROTECTED_ANCESTORS = {
+_PROTECTED_ANCESTORS: dict[str, SkipReason] = {
     "code": "protected_code",
     "pre": "protected_code",
 }
 
 
-def _skip_reason(elem: etree._Element) -> Optional[SkipReason]:
-    # Protected: code blocks and metadata regions.
+def _skip_reason(elem: etree._Element) -> SkipReason | None:
+    """Return skip reason for protected elements, metadata areas, or embedded code."""
     for anc in [elem, *elem.iterancestors()]:
         tag = etree.QName(anc.tag).localname.lower() if isinstance(anc.tag, str) else ""
         if tag in _PROTECTED_ANCESTORS:
-            return _PROTECTED_ANCESTORS[tag]  # type: ignore[return-value]
-
-        # Metadata-ish regions.
+            return _PROTECTED_ANCESTORS[tag]
         if tag in ("head", "title", "style", "script"):
             return "protected_metadata"
 
-    # Also protect inline descendants containing code blocks or metadata.
     for descendant in elem.iterdescendants():
-        d_tag = etree.QName(descendant.tag).localname.lower() if isinstance(descendant.tag, str) else ""
+        d_tag = (
+            etree.QName(descendant.tag).localname.lower() if isinstance(descendant.tag, str) else ""
+        )
         if d_tag in ("code", "pre"):
             return "protected_code"
-
         if d_tag in ("style", "script"):
             return "protected_metadata"
 
@@ -327,7 +393,10 @@ def _skip_reason(elem: etree._Element) -> Optional[SkipReason]:
 
 
 _ws_re = re.compile(r"\s+")
+
+
 def _limit(text: str, max_len: int) -> str:
+    """Normalize whitespace and truncate text for compact reporting fields."""
     cleaned = _ws_re.sub(" ", text).strip()
     if len(cleaned) <= max_len:
         return cleaned
@@ -335,59 +404,25 @@ def _limit(text: str, max_len: int) -> str:
 
 
 def _backoff_seconds(attempt: int) -> float:
-    return min(4.0, 0.25 * (2**attempt))
+    """Compute exponential retry backoff capped at four seconds."""
+    delay = 0.25 * (2**attempt)
+    return 4.0 if delay > 4.0 else delay
 
 
 def _replace_element_text(elem: etree._Element, translated: str) -> None:
-    """Replace paragraph text, redistributing across child text/tail slots.
-
-    Strategy
-    --------
-    The source text of a paragraph is spread across multiple lxml text slots
-    in document order::
-
-        <p>
-          {elem.text}
-          <span>{span.text}</span>{span.tail}
-          <em>{em.text}</em>{em.tail}
-          …
-        </p>
-
-    We collect those source slots, compute each slot's share of the total
-    character count, then split the *translated* string proportionally at
-    word boundaries and write each chunk back to its original slot.
-
-    This keeps each piece of text in its *owner* element so CSS styling
-    (font-size, italic, dropcap, etc.) is applied to the right words in the
-    translated output – maximally faithful to the original structure.
-
-    Self-closing tag prevention
-    ---------------------------
-    Setting ``.text = ""`` (empty string, *not* ``None``) on childless
-    elements forces lxml's XML serialiser to emit ``<span></span>`` instead
-    of ``<span/>``.  HTML-based EPUB readers misinterpret ``<span/>`` as an
-    unclosed opening tag, which causes all subsequent text to inherit the
-    span's styling (e.g. a dropcap ``font-size: 1.83333em`` bleeding through
-    the whole chapter).
-    """
+    """Replace node text while preserving inline markup ownership of text slots."""
     slots = _collect_text_slots(elem)
 
     if not slots:
-        # No text slots at all – place translated text directly.
         elem.text = translated
         return
 
-    # Lengths of the original text in each slot.
     slot_lengths = [len(getattr(owner, attr) or "") for owner, attr in slots]
-
-    # Distribute translated text proportionally across slots.
     chunks = _distribute_text(translated, slot_lengths)
 
     for (owner, attr), chunk in zip(slots, chunks):
         setattr(owner, attr, chunk)
 
-    # Ensure every child that received no text still gets an empty string
-    # (not None) so XML serialises it as <tag></tag> not <tag/>.
     for child in elem:
         if not _is_writable_element(child):
             continue

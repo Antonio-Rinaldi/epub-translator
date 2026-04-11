@@ -2,27 +2,166 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 from rich.console import Console
 
 from epub_translate_cli.application.services.translation_orchestrator import TranslationOrchestrator
-from epub_translate_cli.domain.models import TranslationSettings
+from epub_translate_cli.domain.models import TranslationRunResult, TranslationSettings
 from epub_translate_cli.infrastructure.epub.epub_repository import ZipEpubRepository
 from epub_translate_cli.infrastructure.llm.ollama_translator import OllamaTranslator
-from epub_translate_cli.infrastructure.logging.logger_factory import configure_logging, create_logger
+from epub_translate_cli.infrastructure.logging.logger_factory import (
+    configure_logging,
+    create_logger,
+)
 from epub_translate_cli.infrastructure.reporting.json_report_writer import JsonReportWriter
 
 console = Console()
 logger = create_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TranslateCommand:
+    """Validated CLI command payload used by translation pipeline."""
+
+    input_path: Path
+    output_path: Path
+    source_lang: str
+    target_lang: str
+    model: str
+    temperature: float
+    retries: int
+    report_path: Path
+    abort_on_error: bool
+    log_level: str
+    ollama_url: str
+    workers: int
+    context_paragraphs: int
+    reset_resume_state: bool
+
+
 def _abort(msg: str) -> None:
-    """Print an error and exit with code 1 before any processing begins."""
+    """Print an error and stop command execution with non-zero exit code."""
     console.print(f"[bold red]Error:[/bold red] {msg}")
     raise typer.Exit(code=1)
+
+
+def _validate_input_path(input_path: Path) -> None:
+    """Validate input path exists and points to a file."""
+    if not input_path.exists():
+        _abort(f"Input file not found: {input_path}")
+    if not input_path.is_file():
+        _abort(f"--in must point to a file, not a directory: {input_path}")
+
+
+def _resolve_report_path(output_path: Path, report_out: Path | None) -> Path:
+    """Resolve report output path from flag or derived default."""
+    return report_out or output_path.with_suffix(output_path.suffix + ".report.json")
+
+
+def _build_command(
+    *,
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    model: str,
+    temperature: float,
+    retries: int,
+    report_out: Path | None,
+    abort_on_error: bool,
+    log_level: str,
+    ollama_url: str,
+    workers: int,
+    context_paragraphs: int,
+    reset_resume_state: bool,
+) -> TranslateCommand:
+    """Build immutable validated command object from raw CLI arguments."""
+    _validate_input_path(input_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return TranslateCommand(
+        input_path=input_path,
+        output_path=output_path,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        model=model,
+        temperature=temperature,
+        retries=retries,
+        report_path=_resolve_report_path(output_path, report_out),
+        abort_on_error=abort_on_error,
+        log_level=log_level,
+        ollama_url=ollama_url,
+        workers=workers,
+        context_paragraphs=context_paragraphs,
+        reset_resume_state=reset_resume_state,
+    )
+
+
+def _build_settings(command: TranslateCommand) -> TranslationSettings:
+    """Map validated command data to domain translation settings."""
+    return TranslationSettings(
+        source_lang=command.source_lang,
+        target_lang=command.target_lang,
+        model=command.model,
+        temperature=command.temperature,
+        retries=command.retries,
+        abort_on_error=command.abort_on_error,
+        workers=command.workers,
+        context_paragraphs=command.context_paragraphs,
+    )
+
+
+def _duration_hms(total_seconds: float) -> str:
+    """Convert elapsed seconds to HH:MM:SS."""
+    hh, rem = divmod(int(total_seconds), 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def _run_translation(
+    command: TranslateCommand,
+    settings: TranslationSettings,
+) -> tuple[TranslationRunResult, float]:
+    """Execute orchestrator translation run and return result with elapsed seconds."""
+    orchestrator = TranslationOrchestrator(
+        epub_repository=ZipEpubRepository(),
+        translator=OllamaTranslator(base_url=command.ollama_url),
+        report_writer=JsonReportWriter(),
+    )
+
+    start = time.perf_counter()
+    result = orchestrator.translate_epub(
+        input_path=command.input_path,
+        output_path=command.output_path,
+        report_path=command.report_path,
+        settings=settings,
+        reset_resume_state=command.reset_resume_state,
+    )
+    elapsed = time.perf_counter() - start
+    return result, elapsed
+
+
+def _print_summary(
+    report_path: Path,
+    output_written: bool,
+    failures: int,
+    elapsed_seconds: float,
+) -> None:
+    """Print terminal summary after run completion."""
+    console.print(f"Report written: {report_path}")
+    console.print(
+        json.dumps(
+            {
+                "output_written": output_written,
+                "failures": failures,
+                "duration": _duration_hms(elapsed_seconds),
+            },
+            indent=2,
+        )
+    )
 
 
 def translate(
@@ -33,17 +172,19 @@ def translate(
     model: Annotated[str, typer.Option("--model", help="Ollama model for translation")],
     temperature: Annotated[float, typer.Option("--temperature", min=0.0, max=2.0)] = 0.2,
     retries: Annotated[int, typer.Option("--retries", min=0, max=10)] = 3,
-    report_out: Annotated[Optional[Path], typer.Option("--report-out")] = None,
+    report_out: Annotated[Path | None, typer.Option("--report-out")] = None,
     abort_on_error: Annotated[bool, typer.Option("--abort-on-error")] = False,
     log_level: Annotated[
-        str, typer.Option("--log-level", help="Logging level: DEBUG or INFO")
+        str,
+        typer.Option("--log-level", help="Logging level: DEBUG or INFO"),
     ] = "INFO",
     ollama_url: Annotated[
         str,
         typer.Option("--ollama-url", help="Ollama API base URL for the translation model"),
     ] = "http://localhost:11434",
     workers: Annotated[
-        int, typer.Option("--workers", min=1, max=32, help="Parallel chapter workers")
+        int,
+        typer.Option("--workers", min=1, max=32, help="Parallel chapter workers"),
     ] = 1,
     context_paragraphs: Annotated[
         int,
@@ -57,85 +198,55 @@ def translate(
             ),
         ),
     ] = 3,
+    reset_resume_state: Annotated[
+        bool,
+        typer.Option(
+            "--reset-resume-state",
+            help="Clear staged chapter resume data before starting this run",
+        ),
+    ] = False,
 ) -> None:
     """Translate an EPUB using a local Ollama model."""
-
-    configure_logging(log_level)
-
-    # 1. Input EPUB must exist and be a file.
-    if not in_path.exists():
-        _abort(f"Input file not found: {in_path}")
-    if not in_path.is_file():
-        _abort(f"--in must point to a file, not a directory: {in_path}")
-
-    # 2. Output EPUB: create parent directory tree if needed.
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    report_path = report_out or out_path.with_suffix(out_path.suffix + ".report.json")
-
-    settings = TranslationSettings(
+    command = _build_command(
+        input_path=in_path,
+        output_path=out_path,
         source_lang=source_lang,
         target_lang=target_lang,
         model=model,
         temperature=temperature,
         retries=retries,
+        report_out=report_out,
         abort_on_error=abort_on_error,
+        log_level=log_level,
+        ollama_url=ollama_url,
         workers=workers,
         context_paragraphs=context_paragraphs,
+        reset_resume_state=reset_resume_state,
     )
 
-    epub_repo = ZipEpubRepository()
-    translator = OllamaTranslator(base_url=ollama_url)
-    report_writer = JsonReportWriter()
-
-    orchestrator = TranslationOrchestrator(
-        epub_repository=epub_repo,
-        translator=translator,
-        report_writer=report_writer,
-    )
+    configure_logging(command.log_level)
+    settings = _build_settings(command)
 
     logger.info(
         "Starting translation | in=%s out=%s source=%s target=%s model=%s",
-        in_path,
-        out_path,
-        source_lang,
-        target_lang,
-        model,
+        command.input_path,
+        command.output_path,
+        command.source_lang,
+        command.target_lang,
+        command.model,
     )
 
-    start = time.perf_counter()
-    result = orchestrator.translate_epub(
-        input_path=in_path,
-        output_path=out_path,
-        report_path=report_path,
-        settings=settings,
-    )
-    end = time.perf_counter()
-
-    elapsed = end - start
-    hh, rem = divmod(int(elapsed), 3600)
-    mm, ss = divmod(rem, 60)
-    duration_hms = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    result, elapsed = _run_translation(command, settings)
+    duration_hms = _duration_hms(elapsed)
 
     logger.info(
         "Translation finished | output_written=%s failures=%s report=%s exit_code=%s in %s",
         result.output_written,
         result.failures,
-        report_path,
+        command.report_path,
         result.exit_code,
         duration_hms,
     )
 
-    console.print(f"Report written: {report_path}")
-    console.print(
-        json.dumps(
-            {
-                "output_written": result.output_written,
-                "failures": result.failures,
-                "duration": duration_hms,
-            },
-            indent=2,
-        )
-    )
-
+    _print_summary(command.report_path, result.output_written, result.failures, elapsed)
     raise typer.Exit(code=result.exit_code)
