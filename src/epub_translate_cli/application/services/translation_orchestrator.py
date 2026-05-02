@@ -9,25 +9,20 @@ from epub_translate_cli.domain.errors import EpubReadError, EpubWriteError
 from epub_translate_cli.domain.models import (
     ChapterDocument,
     ChapterReport,
+    ChapterTranslationResult,
+    EpubBook,
     RunReport,
+    StagedChapter,
     TranslationRunResult,
     TranslationSettings,
 )
 from epub_translate_cli.domain.ports import (
-    EpubBook,
+    ChapterProcessorPort,
+    ChapterStageStorePort,
     EpubRepositoryPort,
     ReportWriterPort,
-    TranslatorPort,
-)
-from epub_translate_cli.infrastructure.epub.xhtml_parser import (
-    ChapterTranslationResult,
-    XHTMLTranslator,
 )
 from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
-from epub_translate_cli.infrastructure.reporting.chapter_stage_store import (
-    FilesystemChapterStageStore,
-    StagedChapter,
-)
 
 logger = create_logger(__name__)
 
@@ -45,8 +40,9 @@ class TranslationOrchestrator:
     """Application facade orchestrating EPUB translation runs."""
 
     epub_repository: EpubRepositoryPort
-    translator: TranslatorPort
+    chapter_processor: ChapterProcessorPort
     report_writer: ReportWriterPort
+    stage_store: ChapterStageStorePort
 
     def translate_epub(
         self,
@@ -58,32 +54,32 @@ class TranslationOrchestrator:
     ) -> TranslationRunResult:
         """Translate an EPUB and produce translated output and report artifacts."""
         book = self._load_book(input_path)
-        stage_store = FilesystemChapterStageStore.for_run(
-            input_path=input_path,
-            output_path=output_path,
-            report_path=report_path,
-            settings=settings,
-        )
+
         if reset_resume_state:
             logger.info("Resetting staged resume workspace before translation")
-            stage_store.clear()
-        resumed = stage_store.load_completed()
+            self.stage_store.clear()
+
+        resumed = self.stage_store.load_completed()
         logger.info("Loaded EPUB | chapters=%s workers=%s", len(book.chapters), settings.workers)
         if resumed:
-            logger.info(
-                "Resuming run from staged chapters | completed=%s",
-                len(resumed),
-            )
+            logger.info("Resuming run from staged chapters | completed=%s", len(resumed))
 
-        xhtml_translator = XHTMLTranslator(translator=self.translator, settings=settings)
         chapter_overrides, chapter_reports = self._translate_chapters(
             book,
-            xhtml_translator,
             settings.workers,
-            stage_store,
             resumed,
         )
         updated_items = self._merged_items(book.items, chapter_overrides)
+
+        failures_count = sum(len(r.failures) for r in chapter_reports)
+        output_written, exit_code = self._write_output_if_allowed(
+            updated_items=updated_items,
+            chapters=book.chapters,
+            compression_types=book.compression_types,
+            output_path=output_path,
+            abort_on_error=settings.abort_on_error,
+            failures_count=failures_count,
+        )
 
         report = self._build_run_report(
             input_path=input_path,
@@ -91,21 +87,13 @@ class TranslationOrchestrator:
             report_path=report_path,
             settings=settings,
             chapter_reports=chapter_reports,
-            output_written=False,
+            output_written=output_written,
         )
-
-        output_written, exit_code = self._write_output_if_allowed(
-            report=report,
-            updated_items=updated_items,
-            chapters=book.chapters,
-            output_path=output_path,
-            abort_on_error=settings.abort_on_error,
-        )
-
-        report.output_written = output_written
         self.report_writer.write(report, report_path)
+
         if output_written:
-            stage_store.clear()
+            self.stage_store.clear()
+
         totals = report.totals()
         logger.info(
             "Run completed | changed=%s failed=%s skipped=%s output_written=%s",
@@ -141,23 +129,22 @@ class TranslationOrchestrator:
     @staticmethod
     def _chapter_report(
         chapter_path: str,
-        chapter_result: ChapterTranslationResult,
+        result: ChapterTranslationResult,
     ) -> ChapterReport:
-        """Convert parser chapter result into report section object."""
+        """Convert chapter result into a frozen report section."""
         return ChapterReport(
             chapter_path=chapter_path,
-            changes=list(chapter_result.changes),
-            failures=list(chapter_result.failures),
-            skips=list(chapter_result.skips),
+            changes=tuple(result.changes),
+            failures=tuple(result.failures),
+            skips=tuple(result.skips),
         )
 
     @staticmethod
     def _ordered_reports(chapter_reports: list[ChapterReport | None]) -> list[ChapterReport]:
         """Return ordered chapter reports after validating all entries are populated."""
-        if any(report is None for report in chapter_reports):
-            missing = sum(1 for report in chapter_reports if report is None)
-            raise RuntimeError(f"Missing chapter reports for {missing} chapters")
-        return [report for report in chapter_reports if report is not None]
+        missing = sum(1 for r in chapter_reports if r is None)
+        assert missing == 0, f"Missing chapter reports for {missing} chapters"
+        return [r for r in chapter_reports if r is not None]
 
     @staticmethod
     def _merged_items(
@@ -169,12 +156,10 @@ class TranslationOrchestrator:
     def _translate_chapters(
         self,
         book: EpubBook,
-        xhtml_translator: XHTMLTranslator,
         workers: int,
-        stage_store: FilesystemChapterStageStore,
         resumed: dict[int, StagedChapter],
     ) -> tuple[dict[str, bytes], list[ChapterReport]]:
-        """Translate pending chapters and merge them with resumed staged chapter snapshots."""
+        """Translate pending chapters and merge with resumed staged chapter snapshots."""
         works = self._chapter_works(book.chapters)
         resumed_indexes = set(resumed)
         pending_works = [work for work in works if (work.chapter_index - 1) not in resumed_indexes]
@@ -188,8 +173,7 @@ class TranslationOrchestrator:
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._translate_one_chapter, xhtml_translator, work): work
-                for work in pending_works
+                pool.submit(self._translate_one_chapter, work): work for work in pending_works
             }
             for future in as_completed(futures):
                 index, updated_xhtml, result = future.result()
@@ -197,7 +181,7 @@ class TranslationOrchestrator:
                 updated_items[chapter.path] = updated_xhtml
                 chapter_report = self._chapter_report(chapter.path, result)
                 chapter_reports[index] = chapter_report
-                stage_store.save_chapter(
+                self.stage_store.save_chapter(
                     chapter_index=index,
                     chapter_path=chapter.path,
                     xhtml_bytes=updated_xhtml,
@@ -206,19 +190,35 @@ class TranslationOrchestrator:
 
         return updated_items, self._ordered_reports(chapter_reports)
 
-    @staticmethod
     def _translate_one_chapter(
-        xhtml_translator: XHTMLTranslator,
+        self,
         work: _ChapterWork,
     ) -> tuple[int, bytes, ChapterTranslationResult]:
-        """Translate one chapter and return zero-based index, bytes, and report."""
+        """Translate one chapter and return zero-based index, bytes, and result."""
+        chapter_index = work.chapter_index - 1  # zero-based index used throughout
+
         logger.info(
             "Translating chapter %s/%s | path=%s",
             work.chapter_index,
             work.total,
             work.chapter.path,
         )
-        updated_xhtml, result = xhtml_translator.translate_chapter(work.chapter)
+
+        def _on_progress(xhtml_bytes: bytes) -> None:
+            """Write current XHTML state to the staging file after each paragraph.
+
+            Uses save_progress (XHTML-only, no manifest update) so concurrent
+            chapters translating in parallel never race on the shared manifest.
+            """
+            self.stage_store.save_progress(
+                chapter_index=chapter_index,
+                xhtml_bytes=xhtml_bytes,
+            )
+
+        updated_xhtml, result = self.chapter_processor.translate_chapter(
+            work.chapter,
+            on_progress=_on_progress,
+        )
         logger.debug(
             "Chapter completed | path=%s changed=%s failed=%s skipped=%s",
             work.chapter.path,
@@ -226,7 +226,7 @@ class TranslationOrchestrator:
             len(result.failures),
             len(result.skips),
         )
-        return work.chapter_index - 1, updated_xhtml, result
+        return chapter_index, updated_xhtml, result
 
     @staticmethod
     def _build_run_report(
@@ -238,7 +238,7 @@ class TranslationOrchestrator:
         chapter_reports: list[ChapterReport],
         output_written: bool,
     ) -> RunReport:
-        """Assemble final run report data object."""
+        """Assemble fully-constructed immutable run report."""
         return RunReport(
             input_path=str(input_path),
             output_path=str(output_path),
@@ -250,27 +250,34 @@ class TranslationOrchestrator:
             retries=settings.retries,
             abort_on_error=settings.abort_on_error,
             output_written=output_written,
-            chapters=chapter_reports,
+            chapters=tuple(chapter_reports),
         )
 
     def _write_output_if_allowed(
         self,
         *,
-        report: RunReport,
         updated_items: dict[str, bytes],
         chapters: list[ChapterDocument],
+        compression_types: dict[str, int],
         output_path: Path,
         abort_on_error: bool,
+        failures_count: int,
     ) -> tuple[bool, int]:
         """Write translated EPUB unless abort-on-error policy blocks output creation."""
-        failures_count = report.totals()["failed"]
         if abort_on_error and failures_count > 0:
             logger.info("Aborting EPUB write due to failures | failures=%s", failures_count)
             return False, 2
 
         logger.info("Writing translated EPUB | path=%s", output_path)
         try:
-            self.epub_repository.save(EpubBook(items=updated_items, chapters=chapters), output_path)
+            self.epub_repository.save(
+                EpubBook(
+                    items=updated_items,
+                    chapters=chapters,
+                    compression_types=compression_types,
+                ),
+                output_path,
+            )
         except Exception as exc:  # noqa: BLE001
             raise EpubWriteError(str(exc)) from exc
 

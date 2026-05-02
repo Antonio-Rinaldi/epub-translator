@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
-from typing import Protocol
+import pytest
 
+from epub_translate_cli.domain.errors import RetryableTranslationError
 from epub_translate_cli.infrastructure.llm.ollama_translator import _sanitise_response
 
 
-class _CapLogFixture(Protocol):
-    text: str
-
-    def at_level(self, level: int) -> AbstractContextManager[object]: ...
-
-
 class TestSanitiseResponse:
-    """Tests for _sanitise_response which strips leaked prompt content."""
+    """Tests for _sanitise_response."""
 
     def test_clean_response_unchanged(self) -> None:
         result = _sanitise_response("Ciao mondo", "Hello world")
@@ -37,40 +31,43 @@ class TestSanitiseResponse:
         result = _sanitise_response(raw, "Chapter 1")
         assert result == "Capitolo 1"
 
-    def test_strips_leaked_italian_marker(self) -> None:
+    def test_italian_markers_no_longer_stripped(self) -> None:
+        """Italian markers from an old prompt version are no longer matched."""
         raw = "CONTESTO DEL CAPITOLO:\nQualche contesto...\n\nTESTO DA TRADURRE:\nI Paesi Bassi"
-        result = _sanitise_response(raw, "THE NETHERLANDS")
-        assert result == "I Paesi Bassi"
+        # The raw text has no HTML injection and is not excessively long → passes through.
+        result = _sanitise_response(raw, "x" * 500)
+        assert result == raw
 
-    def test_strips_leaked_testo_da_tradurre_with_colon(self) -> None:
-        raw = "TESTO DA TRADURRE: Capitolo 1"
+    def test_strips_text_to_translate_marker_with_colon(self) -> None:
+        raw = "TEXT TO TRANSLATE: Capitolo 1"
         result = _sanitise_response(raw, "Chapter 1")
         assert result == "Capitolo 1"
 
-    def test_warns_on_excessive_length_ratio(self, caplog: _CapLogFixture) -> None:
-        import logging
+    def test_empty_result_raises(self) -> None:
+        with pytest.raises(RetryableTranslationError, match="Empty"):
+            _sanitise_response("", "Hello")
 
-        long_response = "A" * 1000
-        with caplog.at_level(logging.WARNING):
-            result = _sanitise_response(long_response, "Hi")
-        assert result == long_response  # kept but warned
-        assert "possible context leak" in caplog.text.lower()
+    def test_html_injection_raises(self) -> None:
+        with pytest.raises(RetryableTranslationError, match="HTML tag injection"):
+            _sanitise_response("<b>Ciao</b>", "Hello")
 
-    def test_no_warning_for_normal_ratio(self, caplog: _CapLogFixture) -> None:
-        import logging
-
-        with caplog.at_level(logging.WARNING):
-            _sanitise_response("Ciao mondo", "Hello world")
-        assert "context leak" not in caplog.text.lower()
+    def test_excessive_length_raises(self) -> None:
+        with pytest.raises(RetryableTranslationError, match="context leak"):
+            _sanitise_response("A" * 1000, "Hi")
 
     def test_empty_source_no_crash(self) -> None:
         result = _sanitise_response("Tradotto", "")
         assert result == "Tradotto"
 
-    def test_leaked_prompt_with_only_markers_returns_empty(self) -> None:
-        """If the model returns only the marker with nothing after, return marker text."""
+    def test_leaked_prompt_with_only_markers_returns_original(self) -> None:
+        """If the marker matches but nothing follows, the original text is returned."""
         raw = "TEXT TO TRANSLATE:"
-        result = _sanitise_response(raw, "Hello")
-        # The regex strips everything up to the marker; if nothing is left
-        # it falls back to the original text.
+        # Use a source long enough that the length ratio check doesn't trigger.
+        result = _sanitise_response(raw, "Hello world and more text here to avoid ratio limit")
         assert result == "TEXT TO TRANSLATE:"
+
+    def test_strips_fence_echoed_block(self) -> None:
+        """If model echoes the <<<...>>> block, strip it and return what follows."""
+        raw = "<<<\nOriginal source text\n>>>\nCiao mondo tradotto."
+        result = _sanitise_response(raw, "Original source text")
+        assert result == "Ciao mondo tradotto."

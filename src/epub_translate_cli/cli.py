@@ -9,13 +9,23 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from epub_translate_cli.application.services.chapter_translator import ChapterTranslator
 from epub_translate_cli.application.services.translation_orchestrator import TranslationOrchestrator
 from epub_translate_cli.domain.models import TranslationRunResult, TranslationSettings
 from epub_translate_cli.infrastructure.epub.epub_repository import ZipEpubRepository
+from epub_translate_cli.infrastructure.epub.xhtml_parser import XHTMLTranslator
 from epub_translate_cli.infrastructure.llm.ollama_translator import OllamaTranslator
+from epub_translate_cli.infrastructure.llm.prompt_builder import (
+    GlossaryAwarePromptBuilder,
+    JsonGlossaryLoader,
+    TomlGlossaryLoader,
+)
 from epub_translate_cli.infrastructure.logging.logger_factory import (
     configure_logging,
     create_logger,
+)
+from epub_translate_cli.infrastructure.reporting.chapter_stage_store import (
+    FilesystemChapterStageStore,
 )
 from epub_translate_cli.infrastructure.reporting.json_report_writer import JsonReportWriter
 
@@ -41,6 +51,7 @@ class TranslateCommand:
     workers: int
     context_paragraphs: int
     reset_resume_state: bool
+    glossary_path: Path | None = None
 
 
 def _abort(msg: str) -> None:
@@ -78,6 +89,7 @@ def _build_command(
     workers: int,
     context_paragraphs: int,
     reset_resume_state: bool,
+    glossary_path: Path | None,
 ) -> TranslateCommand:
     """Build immutable validated command object from raw CLI arguments."""
     _validate_input_path(input_path)
@@ -97,6 +109,7 @@ def _build_command(
         workers=workers,
         context_paragraphs=context_paragraphs,
         reset_resume_state=reset_resume_state,
+        glossary_path=glossary_path,
     )
 
 
@@ -121,15 +134,47 @@ def _duration_hms(total_seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
+def _load_glossary_terms(glossary_path: Path | None) -> dict[str, str]:
+    """Load glossary terms from file if path is provided, otherwise return empty dict."""
+    if glossary_path is None:
+        return {}
+    suffix = glossary_path.suffix.lower()
+    if suffix == ".toml":
+        return TomlGlossaryLoader().load(glossary_path).as_dict()
+    if suffix == ".json":
+        return JsonGlossaryLoader().load(glossary_path).as_dict()
+    _abort(f"Unsupported glossary file format: {suffix} (use .toml or .json)")
+    return {}  # unreachable, but needed for type checker
+
+
 def _run_translation(
     command: TranslateCommand,
     settings: TranslationSettings,
 ) -> tuple[TranslationRunResult, float]:
-    """Execute orchestrator translation run and return result with elapsed seconds."""
+    """Wire all adapters and execute the orchestrator translation run."""
+    glossary_terms = _load_glossary_terms(command.glossary_path)
+    translator = OllamaTranslator(
+        settings=settings,
+        base_url=command.ollama_url,
+        prompt_builder=GlossaryAwarePromptBuilder(),
+    )
+    chapter_processor = ChapterTranslator(
+        translator=translator,
+        settings=settings,
+        xhtml_parser=XHTMLTranslator(),
+        glossary_terms=glossary_terms,
+    )
+    stage_store = FilesystemChapterStageStore.for_run(
+        input_path=command.input_path,
+        output_path=command.output_path,
+        report_path=command.report_path,
+        settings=settings,
+    )
     orchestrator = TranslationOrchestrator(
         epub_repository=ZipEpubRepository(),
-        translator=OllamaTranslator(base_url=command.ollama_url),
+        chapter_processor=chapter_processor,
         report_writer=JsonReportWriter(),
+        stage_store=stage_store,
     )
 
     start = time.perf_counter()
@@ -205,6 +250,13 @@ def translate(
             help="Clear staged chapter resume data before starting this run",
         ),
     ] = False,
+    glossary: Annotated[
+        Path | None,
+        typer.Option(
+            "--glossary",
+            help="Optional glossary file (.toml or .json) with term→translation mappings",
+        ),
+    ] = None,
 ) -> None:
     """Translate an EPUB using a local Ollama model."""
     command = _build_command(
@@ -222,6 +274,7 @@ def translate(
         workers=workers,
         context_paragraphs=context_paragraphs,
         reset_resume_state=reset_resume_state,
+        glossary_path=glossary,
     )
 
     configure_logging(command.log_level)

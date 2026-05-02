@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from epub_translate_cli.domain.models import (
     ChapterReport,
@@ -12,28 +12,14 @@ from epub_translate_cli.domain.models import (
     NodeFailure,
     NodeSkip,
     SkipReason,
+    StagedChapter,
     TranslationSettings,
 )
 from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
 
 logger = create_logger(__name__)
 
-_SKIP_REASON_MAP: dict[str, SkipReason] = {
-    "protected_code": "protected_code",
-    "protected_metadata": "protected_metadata",
-    "empty": "empty",
-}
-
-
-@dataclass(frozen=True)
-class StagedChapter:
-    """Chapter bytes/report snapshot loaded from persistent staging workspace."""
-
-    chapter_index: int
-    chapter_path: str
-    xhtml_bytes: bytes
-    report: ChapterReport
-    completed: bool
+_VALID_SKIP_REASONS: frozenset[str] = frozenset(get_args(SkipReason))
 
 
 @dataclass(frozen=True)
@@ -69,6 +55,7 @@ class FilesystemChapterStageStore:
             "temperature": settings.temperature,
             "retries": settings.retries,
             "context_paragraphs": settings.context_paragraphs,
+            "workers": settings.workers,
             "input_exists": input_exists,
             "input_size": input_stats.st_size if input_stats is not None else 0,
             "input_mtime_ns": input_stats.st_mtime_ns if input_stats is not None else 0,
@@ -95,6 +82,17 @@ class FilesystemChapterStageStore:
             item.chapter_index: item for item in staged_items if item is not None and item.completed
         }
 
+    def save_progress(self, *, chapter_index: int, xhtml_bytes: bytes) -> None:
+        """Write updated XHTML bytes for an in-progress chapter without touching the manifest.
+
+        Called after each paragraph translation so the file on disk reflects current
+        progress. Does not update the manifest, so the chapter is never considered
+        completed from this call alone. Thread-safe: each chapter writes to its own file.
+        """
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        chapter_rel = f"chapters/{chapter_index:05d}.xhtml"
+        self._write_bytes_atomic(self.workspace_dir / chapter_rel, xhtml_bytes)
+
     def save_chapter(
         self,
         *,
@@ -103,7 +101,7 @@ class FilesystemChapterStageStore:
         xhtml_bytes: bytes,
         report: ChapterReport,
     ) -> None:
-        """Persist one translated chapter snapshot and update the manifest atomically."""
+        """Persist a fully-translated chapter snapshot and update the manifest atomically."""
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         chapter_rel = f"chapters/{chapter_index:05d}.xhtml"
         report_rel = f"reports/{chapter_index:05d}.json"
@@ -112,7 +110,7 @@ class FilesystemChapterStageStore:
         self._write_text_atomic(
             self.workspace_dir / report_rel,
             json.dumps(
-                self._serialize_report(report),
+                asdict(report),
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -225,7 +223,7 @@ class FilesystemChapterStageStore:
         if not isinstance(report_payload, dict):
             return None
 
-        report = self._deserialize_report(report_payload, chapter_path)
+        report = _deserialize_report(report_payload, chapter_path)
         return StagedChapter(
             chapter_index=chapter_index,
             chapter_path=chapter_path,
@@ -234,94 +232,67 @@ class FilesystemChapterStageStore:
             completed=completed,
         )
 
-    @staticmethod
-    def _serialize_report(report: ChapterReport) -> dict[str, object]:
-        return {
-            "chapter_path": report.chapter_path,
-            "changes": [
-                {
-                    "chapter_path": item.chapter_path,
-                    "node_path": item.node_path,
-                    "before": item.before,
-                    "after": item.after,
-                }
-                for item in report.changes
-            ],
-            "failures": [
-                {
-                    "chapter_path": item.chapter_path,
-                    "node_path": item.node_path,
-                    "text": item.text,
-                    "error_type": item.error_type,
-                    "message": item.message,
-                    "attempts": item.attempts,
-                }
-                for item in report.failures
-            ],
-            "skips": [
-                {
-                    "chapter_path": item.chapter_path,
-                    "node_path": item.node_path,
-                    "reason": item.reason,
-                }
-                for item in report.skips
-            ],
-        }
 
-    @staticmethod
-    def _deserialize_report(payload: dict[str, object], chapter_path: str) -> ChapterReport:
-        def _skip_reason(raw_reason: object) -> SkipReason:
-            return _SKIP_REASON_MAP.get(str(raw_reason), "empty")
+def _parse_skip_reason(raw: object) -> SkipReason:
+    """Return a valid SkipReason from a raw deserialized value, defaulting to 'empty'."""
+    s = str(raw)
+    if s in _VALID_SKIP_REASONS:
+        return s  # type: ignore[return-value]
+    return "empty"
 
-        changes_raw = payload.get("changes")
-        failures_raw = payload.get("failures")
-        skips_raw = payload.get("skips")
-        changes = (
-            [
-                NodeChange(
-                    chapter_path=str(item.get("chapter_path", chapter_path)),
-                    node_path=str(item.get("node_path", "")),
-                    before=str(item.get("before", "")),
-                    after=str(item.get("after", "")),
-                )
-                for item in changes_raw
-                if isinstance(item, dict)
-            ]
-            if isinstance(changes_raw, list)
-            else []
+
+def _deserialize_report(payload: dict[str, object], chapter_path: str) -> ChapterReport:
+    """Reconstruct a ChapterReport from its JSON-serialized dict representation."""
+    changes_raw = payload.get("changes")
+    failures_raw = payload.get("failures")
+    skips_raw = payload.get("skips")
+
+    changes = (
+        tuple(
+            NodeChange(
+                chapter_path=str(item.get("chapter_path", chapter_path)),
+                node_path=str(item.get("node_path", "")),
+                before=str(item.get("before", "")),
+                after=str(item.get("after", "")),
+            )
+            for item in changes_raw
+            if isinstance(item, dict)
         )
-        failures = (
-            [
-                NodeFailure(
-                    chapter_path=str(item.get("chapter_path", chapter_path)),
-                    node_path=str(item.get("node_path", "")),
-                    text=str(item.get("text", "")),
-                    error_type=str(item.get("error_type", "UnknownError")),
-                    message=str(item.get("message", "unknown")),
-                    attempts=int(item.get("attempts", 0)),
-                )
-                for item in failures_raw
-                if isinstance(item, dict)
-            ]
-            if isinstance(failures_raw, list)
-            else []
+        if isinstance(changes_raw, list)
+        else ()
+    )
+    failures = (
+        tuple(
+            NodeFailure(
+                chapter_path=str(item.get("chapter_path", chapter_path)),
+                node_path=str(item.get("node_path", "")),
+                text=str(item.get("text", "")),
+                error_type=str(item.get("error_type", "UnknownError")),
+                message=str(item.get("message", "unknown")),
+                attempts=int(item.get("attempts", 0)),
+            )
+            for item in failures_raw
+            if isinstance(item, dict)
         )
-        skips = (
-            [
-                NodeSkip(
-                    chapter_path=str(item.get("chapter_path", chapter_path)),
-                    node_path=str(item.get("node_path", "")),
-                    reason=_skip_reason(item.get("reason", "empty")),
-                )
-                for item in skips_raw
-                if isinstance(item, dict)
-            ]
-            if isinstance(skips_raw, list)
-            else []
+        if isinstance(failures_raw, list)
+        else ()
+    )
+    skips = (
+        tuple(
+            NodeSkip(
+                chapter_path=str(item.get("chapter_path", chapter_path)),
+                node_path=str(item.get("node_path", "")),
+                reason=_parse_skip_reason(item.get("reason", "empty")),
+            )
+            for item in skips_raw
+            if isinstance(item, dict)
         )
-        return ChapterReport(
-            chapter_path=str(payload.get("chapter_path", chapter_path)),
-            changes=changes,
-            failures=failures,
-            skips=skips,
-        )
+        if isinstance(skips_raw, list)
+        else ()
+    )
+    return ChapterReport(
+        chapter_path=str(payload.get("chapter_path", chapter_path)),
+        changes=changes,
+        failures=failures,
+        skips=skips,
+    )

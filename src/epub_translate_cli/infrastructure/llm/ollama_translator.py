@@ -2,106 +2,77 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
 from epub_translate_cli.domain.errors import NonRetryableTranslationError, RetryableTranslationError
-from epub_translate_cli.domain.models import TranslationRequest, TranslationResponse
-from epub_translate_cli.domain.ports import TranslatorPort
+from epub_translate_cli.domain.models import (
+    TranslationRequest,
+    TranslationResponse,
+    TranslationSettings,
+)
+from epub_translate_cli.domain.ports import PromptBuilderPort, TranslatorPort
+from epub_translate_cli.infrastructure.llm.prompt_builder import PromptBuilder
 from epub_translate_cli.infrastructure.logging.logger_factory import create_logger
 
 logger = create_logger(__name__)
 
-# Maximum ratio of translated length to source length before we suspect
-# the model echoed the context/prompt back in the response.
-_MAX_LEN_RATIO = 3.0
+# Maximum ratio of translated length to source length before we suspect a context leak.
+MAX_TRANSLATION_LEN_RATIO = 3.0
 
-# Pattern that matches everything up to (and including) the LAST known
-# prompt marker.  Greedy ``.*`` ensures we consume up to the final
-# occurrence, so all echoed context/headers are stripped.
+# Naive HTML-tag injection detector: "<" followed by a word character.
+_HTML_TAG_RE = re.compile(r"<\w")
+
+# Matches when the model echoes back prompt markers from the user message.
+# Covers the current English-only prompt labels and the <<<...>>> fence pattern.
 _LEAKED_PROMPT_RE = re.compile(
-    r"^.*(?:TESTO DA TRADURRE|TEXT TO TRANSLATE|CHAPTER CONTEXT|CONTESTO DEL CAPITOLO)\s*(?::\s*)?",
+    r"^.*(?:TEXT TO TRANSLATE|CHAPTER CONTEXT)\s*(?::\s*)?",
     re.IGNORECASE | re.DOTALL,
 )
 
-
-@dataclass(frozen=True)
-class PromptBuilder:
-    """Builds deterministic translation prompts for Ollama requests."""
-
-    @staticmethod
-    def _context_block(chapter_context: str) -> str:
-        """Format chapter-level context block used only for style guidance."""
-        if not chapter_context:
-            return ""
-        return (
-            "Below is context from the chapter (for tone/terminology only). "
-            "Do NOT include this context in your response:\n"
-            f"<<<\n{chapter_context}\n>>>\n\n"
-        )
-
-    @staticmethod
-    def _prior_translations_block(prior_translations: str) -> str:
-        """Format rolling prior-translation context block for continuity."""
-        if not prior_translations:
-            return ""
-        return (
-            "Below are the last translated paragraphs (for tone/terminology continuity only). "
-            "Do NOT repeat or include these in your response:\n"
-            f"<<<\n{prior_translations}\n>>>\n\n"
-        )
-
-    def build(self, request: TranslationRequest) -> str:
-        """Build complete prompt with strict output constraints and fences."""
-        return (
-            "You are a professional book translator from "
-            f"{request.source_lang} to {request.target_lang}.\n\n"
-            "RULES:\n"
-            "- Output ONLY the translated text.\n"
-            "- Do NOT add any commentary, labels, quotes, or explanations.\n"
-            "- Do NOT repeat the instructions or the context.\n"
-            "- Preserve meaning, tone, and punctuation exactly where natural "
-            "in the target language.\n"
-            "- Keep sentence-ending punctuation present (., !, ?, ;, :) when the source uses it.\n"
-            "- Do not drop commas or full stops; keep punctuation suitable "
-            "for natural read-aloud rhythm.\n"
-            "- The translated text must have roughly the same length as the original.\n\n"
-            f"{self._context_block(request.chapter_context)}"
-            f"{self._prior_translations_block(request.prior_translations)}"
-            "Translate the following text:\n"
-            f"<<<\n{request.text}\n>>>\n"
-        )
+# Matches when the model echoes back the full fence-delimited text block
+# (i.e., reproduces the "<<<\n...\n>>>" block from the user prompt).
+_FENCE_ECHO_RE = re.compile(r"^.*>>>\s*", re.DOTALL)
 
 
 @dataclass(frozen=True)
 class OllamaTranslator(TranslatorPort):
-    """Translator adapter that calls Ollama local HTTP API."""
+    """Translator adapter that calls Ollama /api/chat with system/user role split."""
 
+    settings: TranslationSettings
     base_url: str = "http://localhost:11434"
     timeout_s: float = 120.0
-    prompt_builder: PromptBuilder = PromptBuilder()
+    prompt_builder: PromptBuilderPort = field(default_factory=PromptBuilder)
 
     @staticmethod
-    def _generate_url(base_url: str) -> str:
-        """Build Ollama generate endpoint URL."""
-        return f"{base_url}/api/generate"
+    def _chat_url(base_url: str) -> str:
+        """Build Ollama chat endpoint URL."""
+        return f"{base_url}/api/chat"
 
-    @staticmethod
-    def _payload(request: TranslationRequest, prompt: str) -> dict[str, object]:
-        """Build Ollama request payload for translation generation."""
+    def _chat_payload(self, request: TranslationRequest) -> dict[str, object]:
+        """Build Ollama /api/chat request payload."""
         return {
-            "model": request.model,
-            "prompt": prompt,
+            "model": self.settings.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self.prompt_builder.build_system_prompt(self.settings),
+                },
+                {
+                    "role": "user",
+                    "content": self.prompt_builder.build_user_prompt(request),
+                },
+            ],
             "stream": False,
-            "options": {"temperature": request.temperature},
+            "options": {"temperature": self.settings.temperature},
         }
 
-    def _post_generate(self, payload: dict[str, object]) -> requests.Response:
-        """Send HTTP request to Ollama and map transport errors to retryable ones."""
+    def _post_chat(self, payload: dict[str, object]) -> requests.Response:
+        """Send HTTP request to Ollama /api/chat and map transport errors to retryable ones."""
         try:
             return requests.post(
-                self._generate_url(self.base_url),
+                self._chat_url(self.base_url),
                 json=payload,
                 timeout=self.timeout_s,
             )
@@ -131,25 +102,26 @@ class OllamaTranslator(TranslatorPort):
 
     @staticmethod
     def _response_text(payload: dict[str, object]) -> str:
-        """Extract raw translated text field from Ollama payload."""
-        raw_text = str(payload.get("response") or "").strip()
+        """Extract raw translated text from Ollama /api/chat response payload."""
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            raise RetryableTranslationError("Missing 'message' field in Ollama response")
+        raw_text = str(message.get("content") or "").strip()
         if not raw_text:
-            raise RetryableTranslationError("Empty response from Ollama")
+            raise RetryableTranslationError("Empty 'message.content' in Ollama response")
         return raw_text
 
     def translate(self, request: TranslationRequest) -> TranslationResponse:
-        """Translate one request via Ollama and return sanitized translated text."""
-        prompt = self.prompt_builder.build(request)
-
+        """Translate one request via Ollama /api/chat and return sanitized translated text."""
         logger.debug(
             "Calling Ollama | model=%s source=%s target=%s text_len=%s",
-            request.model,
-            request.source_lang,
-            request.target_lang,
+            self.settings.model,
+            self.settings.source_lang,
+            self.settings.target_lang,
             len(request.text),
         )
 
-        response = self._post_generate(self._payload(request, prompt))
+        response = self._post_chat(self._chat_payload(request))
         self._validate_response_status(response)
         payload = self._parse_payload(response)
         raw_text = self._response_text(payload)
@@ -164,7 +136,7 @@ class OllamaTranslator(TranslatorPort):
 
 
 def _sanitise_response(raw: str, source_text: str) -> str:
-    """Strip leaked prompt/context sections from model response text."""
+    """Strip leaked prompt/context sections and surrounding quotes from model response."""
     text = raw
 
     if (text.startswith('"') and text.endswith('"')) or (
@@ -172,28 +144,42 @@ def _sanitise_response(raw: str, source_text: str) -> str:
     ):
         text = text[1:-1].strip()
 
+    # Strip if model echoed a prompt label (e.g., "TEXT TO TRANSLATE: ...").
     match = _LEAKED_PROMPT_RE.search(text)
     if match:
         after = text[match.end() :].strip()
         if after:
             logger.warning(
-                "Stripped leaked prompt from response | stripped_chars=%d remaining_chars=%d",
+                "Stripped leaked prompt marker from response | stripped=%d remaining=%d",
                 len(text) - len(after),
                 len(after),
             )
             text = after
 
-    if source_text and len(text) > _MAX_LEN_RATIO * len(source_text):
-        logger.warning(
-            "Translation is %.1fx the source length (%d vs %d chars) – possible context leak",
-            len(text) / len(source_text),
-            len(text),
-            len(source_text),
+    # Strip if model echoed the full fence-delimited text block ("<<<\n...\n>>>").
+    fence_match = _FENCE_ECHO_RE.search(text)
+    if fence_match and "<<<" in text[: fence_match.end()]:
+        after = text[fence_match.end() :].strip()
+        if after:
+            logger.warning(
+                "Stripped fence-echoed block from response | stripped=%d remaining=%d",
+                len(text) - len(after),
+                len(after),
+            )
+            text = after
+
+    if not text:
+        raise RetryableTranslationError("Empty translation after sanitization")
+
+    if _HTML_TAG_RE.search(text):
+        raise RetryableTranslationError(
+            f"HTML tag injection detected in translation: {text[:100]!r}"
+        )
+
+    if source_text and len(text) > MAX_TRANSLATION_LEN_RATIO * len(source_text):
+        raise RetryableTranslationError(
+            f"Translation is {len(text) / len(source_text):.1f}x the source length "
+            f"({len(text)} vs {len(source_text)} chars) – possible context leak"
         )
 
     return text
-
-
-def _build_prompt(req: TranslationRequest) -> str:
-    """Backward-compatible prompt helper preserved for existing imports/tests."""
-    return PromptBuilder().build(req)

@@ -25,6 +25,7 @@ def test_build_command_sets_reset_resume_state(tmp_path: Path) -> None:
         workers=1,
         context_paragraphs=3,
         reset_resume_state=True,
+        glossary_path=None,
     )
 
     assert command.reset_resume_state is True
