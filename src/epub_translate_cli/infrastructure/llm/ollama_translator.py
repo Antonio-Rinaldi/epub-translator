@@ -42,7 +42,7 @@ class OllamaTranslator(TranslatorPort):
 
     settings: TranslationSettings
     base_url: str = "http://localhost:11434"
-    timeout_s: float = 120.0
+    timeout_s: float = -1.0
     prompt_builder: PromptBuilderPort = field(default_factory=PromptBuilder)
 
     @staticmethod
@@ -74,7 +74,7 @@ class OllamaTranslator(TranslatorPort):
             return requests.post(
                 self._chat_url(self.base_url),
                 json=payload,
-                timeout=self.timeout_s,
+                timeout=None if self.timeout_s < 0 else self.timeout_s,
             )
         except requests.RequestException as exc:
             raise RetryableTranslationError(str(exc)) from exc

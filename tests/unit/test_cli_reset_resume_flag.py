@@ -25,6 +25,7 @@ def test_build_command_sets_reset_resume_state(tmp_path: Path) -> None:
         workers=1,
         context_paragraphs=3,
         reset_resume_state=True,
+        ollama_timeout_s=-1.0,
         glossary_path=None,
     )
 

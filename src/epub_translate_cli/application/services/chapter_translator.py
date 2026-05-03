@@ -36,6 +36,11 @@ _FENCE_RE = re.compile(r"^<<<\s*|\s*>>>$")
 
 _NodePair = tuple[etree._Element, TranslatableNode]
 
+# XML attribute added to every translatable node before its turn arrives.
+# Removed once the node is processed (translated or failed).
+# Visible in the staged XHTML file so you can see which paragraphs are pending.
+_PENDING_ATTR = "data-translation-pending"
+
 
 @dataclass(frozen=True)
 class ChapterTranslator:
@@ -57,9 +62,11 @@ class ChapterTranslator:
     ) -> tuple[bytes, ChapterTranslationResult]:
         """Translate one chapter and return updated XHTML bytes plus chapter result.
 
-        `on_progress` is called after every successfully translated paragraph with
-        the current serialised XHTML bytes so callers can write intermediate progress
-        to disk without waiting for the whole chapter to finish.
+        `on_progress` is called:
+        - Once at the start with ALL translatable nodes marked as pending, so the
+          staging file immediately shows which paragraphs still need translation.
+        - After every successfully translated paragraph, so the pending markers
+          disappear one by one as work progresses.
         """
         root, nodes = self.xhtml_parser.parse_chapter(chapter)
         chapter_ctx = self.xhtml_parser.chapter_context(root)
@@ -88,6 +95,18 @@ class ChapterTranslator:
         context_size = self.settings.context_paragraphs
         recent_pairs: deque[tuple[str, str]] = deque(maxlen=context_size if context_size > 0 else 1)
 
+        # Pre-scan: mark every node that will be translated as pending so the
+        # staging file shows all untranslated paragraphs from the very first write.
+        pending_ids: set[int] = set()
+        for elem, node in nodes:
+            if skip_reason(elem) is None and node.source_text:
+                elem.set(_PENDING_ATTR, "true")
+                pending_ids.add(id(elem))
+
+        # Write the initial state: all pending markers visible, no translations yet.
+        if on_progress is not None and pending_ids:
+            on_progress(self.xhtml_parser.serialize_chapter(root))
+
         for elem, node in nodes:
             reason = skip_reason(elem)
             if reason is not None:
@@ -108,6 +127,11 @@ class ChapterTranslator:
                     )
                 )
                 continue
+
+            # Remove the pending marker before attempting translation.
+            # Whether translation succeeds or fails, this node is no longer "pending".
+            if _PENDING_ATTR in elem.attrib:
+                del elem.attrib[_PENDING_ATTR]
 
             translated, attempts, error = self._translate_with_retries(
                 elem=elem,
@@ -146,8 +170,8 @@ class ChapterTranslator:
             if context_size > 0:
                 recent_pairs.append((node.source_text, translated))
 
-            # Write current XHTML state to disk after every successful paragraph
-            # so the staging file reflects live progress.
+            # Write updated XHTML after each successful translation — one fewer
+            # pending marker each time.
             if on_progress is not None:
                 on_progress(self.xhtml_parser.serialize_chapter(root))
 

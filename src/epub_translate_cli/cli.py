@@ -51,6 +51,7 @@ class TranslateCommand:
     workers: int
     context_paragraphs: int
     reset_resume_state: bool
+    ollama_timeout_s: float
     glossary_path: Path | None = None
 
 
@@ -86,6 +87,7 @@ def _build_command(
     abort_on_error: bool,
     log_level: str,
     ollama_url: str,
+    ollama_timeout_s: float,
     workers: int,
     context_paragraphs: int,
     reset_resume_state: bool,
@@ -106,6 +108,7 @@ def _build_command(
         abort_on_error=abort_on_error,
         log_level=log_level,
         ollama_url=ollama_url,
+        ollama_timeout_s=ollama_timeout_s,
         workers=workers,
         context_paragraphs=context_paragraphs,
         reset_resume_state=reset_resume_state,
@@ -156,6 +159,7 @@ def _run_translation(
     translator = OllamaTranslator(
         settings=settings,
         base_url=command.ollama_url,
+        timeout_s=command.ollama_timeout_s,
         prompt_builder=GlossaryAwarePromptBuilder(),
     )
     chapter_processor = ChapterTranslator(
@@ -250,6 +254,13 @@ def translate(
             help="Clear staged chapter resume data before starting this run",
         ),
     ] = False,
+    ollama_timeout: Annotated[
+        float,
+        typer.Option(
+            "--ollama-timeout",
+            help="Ollama request timeout in seconds. Use -1 for no timeout.",
+        ),
+    ] = -1.0,
     glossary: Annotated[
         Path | None,
         typer.Option(
@@ -271,6 +282,7 @@ def translate(
         abort_on_error=abort_on_error,
         log_level=log_level,
         ollama_url=ollama_url,
+        ollama_timeout_s=ollama_timeout,
         workers=workers,
         context_paragraphs=context_paragraphs,
         reset_resume_state=reset_resume_state,
